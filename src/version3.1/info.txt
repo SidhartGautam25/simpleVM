@@ -1,0 +1,201 @@
+================================================================================
+     VERSION 3.1: PHYSICAL CLOCK GENERATOR & MULTI-CYCLE MICRO-STEPPING
+================================================================================
+
+1. OVERVIEW & PURPOSE
+---------------------
+Version 3.1 introduces the physical clock domain of the CPU:
+`clock/clock-generator.js`.
+
+In Version 3.0 and all earlier versions, instruction execution was modeled as a
+single synchronous atomic operation: `vm.step()` executed all stages of an instruction
+at once in a single JavaScript function call.
+
+In real computer hardware:
+  • A CPU core is driven by a quartz crystal oscillator that continuously pulses a
+    periodic digital clock signal (`CLK`: LOW -> RISING EDGE -> HIGH -> FALLING EDGE).
+  • State elements (flip-flops, latches, and register files) CANNOT update all at once.
+    They only capture values on clock transitions (e.g. rising clock edges).
+  • An instruction takes MULTIPLE discrete clock cycles to execute:
+      - Cycle 1: Drive PC to MAR, strobe MemRead.
+      - Cycle 2: Wait for memory response, latch into MDR.
+      - Cycle 3: Drive MDR to IR, increment PC.
+      - Cycle 4: Decode opcode, assert control wires, read register ports.
+      - Cycle 5: Execute ALU arithmetic (and write-back for ADD) OR compute memory address.
+      - Cycle 6: Memory read and write-back (for LD).
+
+Version 3.1 introduces two distinct operational granularities:
+  1. `vm.tick()`: Advances the CPU by exactly ONE physical clock cycle (Micro-step).
+  2. `vm.step()`: Runs multiple clock ticks until the current instruction cycle finishes (Macro-step).
+
+
+================================================================================
+2. HOW VERSION 3.1 DIFFERS FROM VERSION 3.0
+================================================================================
+
+Feature                    Version 3.0                      Version 3.1
+-------------------------  -------------------------------  -------------------------------
+Execution Model            Single-call sequential execution Clock-driven multi-cycle execution
+Clock Source               None (Pure software loop)        `ClockGenerator` (Quartz oscillator)
+Cycle Tracking             None                             `clock.currentCycle` (ticks elapsed)
+Granularities              Macro-step only (`vm.step()`)    Micro-step (`vm.tick()`) & Macro (`step()`)
+Instruction Latency        Instantaneous (1 call)           Multi-cycle:
+                                                            • ADD: 5 physical clock cycles
+                                                            • LD : 6 physical clock cycles
+State Transitions          Immediate function call          Clock-edge synchronized
+Central Bus Transitions    Static function sequence         Cycle-by-cycle micro-operations
+CPI Metric                 Unavailable                      Measured: Average Cycles Per Instruction
+
+
+================================================================================
+3. THE MULTI-CYCLE CLOCK BREAKDOWN IN DETAIL
+================================================================================
+
+Every instruction progresses through a sequence of micro-operations, each occupying
+exactly ONE clock cycle:
+
+--------------------------------------------------------------------------------
+CLOCK CYCLE 1: FETCH-1 (Drive PC to MAR via Central Internal Bus)
+--------------------------------------------------------------------------------
+Hardware Operations:
+  • `GatePC = 1`    : The Program Counter (PC) drives the Central Internal Bus (`BUS <= PC`).
+  • `LD_MAR = 1`    : Memory Address Register latches Central Bus (`MAR <= BUS`).
+  • `MemRead = 1`   : Control Unit asserts MemRead on the external memory bus.
+  • State: MAR is now driving the external memory address bus pins.
+
+--------------------------------------------------------------------------------
+CLOCK CYCLE 2: FETCH-2 (Memory Bus Access & MDR Latch)
+--------------------------------------------------------------------------------
+Hardware Operations:
+  • External RAM responds to the address bus: `RAM[MAR]` is driven onto external Data Bus.
+  • `MDR <= Data Bus` : Memory Data Register captures the 16-bit instruction word.
+  • State: Instruction word is held safely inside MDR.
+
+--------------------------------------------------------------------------------
+CLOCK CYCLE 3: FETCH-3 (Drive MDR to IR & Increment PC)
+--------------------------------------------------------------------------------
+Hardware Operations:
+  • `GateMDR = 1`   : MDR drives the Central Internal Bus (`BUS <= MDR`).
+  • `LD_IR = 1`     : Instruction Register captures Central Bus (`IR <= BUS`).
+  • Incrementer     : `PC <= (PC + 1) & 0xFFFF`.
+  • State: The instruction is now latched in IR; PC points to the next sequential instruction.
+
+--------------------------------------------------------------------------------
+CLOCK CYCLE 4: DECODE (Unpack Fields, Assert Bus Gates & Read Registers)
+--------------------------------------------------------------------------------
+Hardware Operations:
+  • Opcode PLA Decodes `IR` bitfields (DR, SR1, SR2/imm5, pcOffset9).
+  • Control Unit asserts control wire signals and bus gating lines (`GateALU`, `GateMDR`, `LD_REG`, `LD_CC`).
+  • Register File Read Ports: Port A outputs `R[SR1]`, Port B outputs `R[SR2]`.
+  • Sign-Extension: SEXT5 extends immediate; SEXT9 extends PC-relative offset.
+  • State: All execution operands are ready at the inputs of the execution unit.
+
+--------------------------------------------------------------------------------
+CLOCK CYCLE 5: EXECUTE (ALU for ADD; Address Calculation for LD)
+--------------------------------------------------------------------------------
+Hardware Operations:
+  A. For ADD Instruction:
+     • ALUSrc MUX selects between RegFile Port B and SEXT5 immediate.
+     • ALU computes 16-bit addition: `ALU_Out = SR1 + OperandB`.
+     • `GateALU = 1` : ALU Output drives Central Internal Bus (`BUS <= ALU_Out`).
+     • `LD_REG = 1`  : Destination register in Register File captures bus (`R[DR] <= BUS`).
+     • `LD_CC = 1`   : PSR captures condition flags (N, Z, P) evaluated from ALU result.
+     • **INSTRUCTION COMPLETE** (ADD completes in 5 clock cycles).
+
+  B. For LD Instruction:
+     • Address Adder computes: `Effective Address = PC (nextPc) + SEXT9(pcOffset9)`.
+     • `GateMARMUX = 1` : Effective Address drives Central Internal Bus (`BUS <= EffAddr`).
+     • `LD_MAR = 1`     : MAR captures Central Bus (`MAR <= BUS`).
+     • `MemRead = 1`    : Memory read cycle asserted on external memory bus.
+     • **NEEDS CYCLE 6** for memory data arrival and register write-back.
+
+--------------------------------------------------------------------------------
+CLOCK CYCLE 6: MEMORY & WRITE-BACK (Only for LD Instruction)
+--------------------------------------------------------------------------------
+Hardware Operations:
+  • External RAM outputs data word to Data Bus -> `MDR <= Data Bus`.
+  • `GateMDR = 1` : MDR drives Central Internal Bus (`BUS <= MDR`).
+  • `LD_REG = 1`  : Destination register captures bus (`R[DR] <= BUS`).
+  • `LD_CC = 1`   : PSR captures condition flags evaluated from loaded word.
+  • **INSTRUCTION COMPLETE** (LD completes in 6 clock cycles).
+
+
+================================================================================
+4. COMPLETE 5-INSTRUCTION WORKFLOW WALKTHROUGH
+================================================================================
+
+Program:
+  1. `LD R1, #25`      (Load literal 25 into R1)  -> Takes 6 clock cycles
+  2. `LD R2, #-10`     (Load literal -10 into R2) -> Takes 6 clock cycles
+  3. `ADD R0, R1, R2`  (25 + -10 = 15 into R0)    -> Takes 5 clock cycles
+  4. `ADD R3, R0, #5`  (15 + 5 = 20 into R3)      -> Takes 5 clock cycles
+  5. `ADD R4, R0, #-15`(15 + -15 = 0 into R4)     -> Takes 5 clock cycles
+
+--------------------------------------------------------------------------------
+Step-by-Step Clock Execution:
+--------------------------------------------------------------------------------
+
+Instruction 1: LD R1, #25
+  • Clock 1 : FETCH-1 -> GatePC=1, BUS <= 12288, LD_MAR=1, MAR <= 12288, MemRead=1
+  • Clock 2 : FETCH-2 -> Data Bus <= RAM[12288] (0x2204) -> MDR <= 0x2204
+  • Clock 3 : FETCH-3 -> GateMDR=1, BUS <= 0x2204, LD_IR=1, IR <= 0x2204, PC <= 12289
+  • Clock 4 : DECODE  -> Opcode=LD, DR=R1, SEXT9=+4, GateMDR=1, LD_REG=1
+  • Clock 5 : EXECUTE -> Effective Address = 12289 + 4 = 12293, GateMARMUX=1, LD_MAR=1, MAR <= 12293
+  • Clock 6 : MEM & WB-> RAM[12293] reads 25 -> MDR <= 25, GateMDR=1, BUS <= 25, R1 <= 25, PSR <= [P]
+  [Instruction 1 Completed: 6 cycles elapsed]
+
+Instruction 2: LD R2, #-10
+  • Clock 7 : FETCH-1 -> GatePC=1, BUS <= 12289, LD_MAR=1, MAR <= 12289, MemRead=1
+  • Clock 8 : FETCH-2 -> MDR <= RAM[12289] (0x2404)
+  • Clock 9 : FETCH-3 -> GateMDR=1, BUS <= 0x2404, LD_IR=1, PC <= 12290
+  • Clock 10: DECODE  -> Opcode=LD, DR=R2, SEXT9=+4
+  • Clock 11: EXECUTE -> Effective Address = 12290 + 4 = 12294, GateMARMUX=1, LD_MAR=1, MAR <= 12294
+  • Clock 12: MEM & WB-> RAM[12294] reads 65526 (-10) -> MDR <= 65526, GateMDR=1, R2 <= 65526, PSR <= [N]
+  [Instruction 2 Completed: 12 cycles elapsed (6 cycles for this instruction)]
+
+Instruction 3: ADD R0, R1, R2
+  • Clock 13: FETCH-1 -> GatePC=1, BUS <= 12290, LD_MAR=1, MAR <= 12290, MemRead=1
+  • Clock 14: FETCH-2 -> MDR <= RAM[12290] (0x1042)
+  • Clock 15: FETCH-3 -> GateMDR=1, BUS <= 0x1042, LD_IR=1, PC <= 12291
+  • Clock 16: DECODE  -> Opcode=ADD, DR=R0, SR1=R1 (25), SR2=R2 (65526), GateALU=1, LD_REG=1
+  • Clock 17: EXEC & WB-> ALU: 25 + 65526 = 15, GateALU=1, BUS <= 15, R0 <= 15, PSR <= [P]
+  [Instruction 3 Completed: 17 cycles elapsed (5 cycles for this instruction)]
+
+Instruction 4: ADD R3, R0, #5
+  • Clock 18: FETCH-1 -> GatePC=1, BUS <= 12291, LD_MAR=1, MAR <= 12291, MemRead=1
+  • Clock 19: FETCH-2 -> MDR <= RAM[12291] (0x1625)
+  • Clock 20: FETCH-3 -> GateMDR=1, BUS <= 0x1625, LD_IR=1, PC <= 12292
+  • Clock 21: DECODE  -> Opcode=ADD, DR=R3, SR1=R0 (15), imm5=+5, GateALU=1, LD_REG=1
+  • Clock 22: EXEC & WB-> ALU: 15 + 5 = 20, GateALU=1, BUS <= 20, R3 <= 20, PSR <= [P]
+  [Instruction 4 Completed: 22 cycles elapsed (5 cycles for this instruction)]
+
+Instruction 5: ADD R4, R0, #-15
+  • Clock 23: FETCH-1 -> GatePC=1, BUS <= 12292, LD_MAR=1, MAR <= 12292, MemRead=1
+  • Clock 24: FETCH-2 -> MDR <= RAM[12292] (0x1831)
+  • Clock 25: FETCH-3 -> GateMDR=1, BUS <= 0x1831, LD_IR=1, PC <= 12293
+  • Clock 26: DECODE  -> Opcode=ADD, DR=R4, SR1=R0 (15), imm5=-15, GateALU=1, LD_REG=1
+  • Clock 27: EXEC & WB-> ALU: 15 + (-15) = 0, GateALU=1, BUS <= 0, R4 <= 0, PSR <= [Z]
+  [Instruction 5 Completed: 27 cycles elapsed (5 cycles for this instruction)]
+
+Total Execution Metrics:
+  • Total Instructions: 5
+  • Total Clock Cycles: 27 cycles (6 + 6 + 5 + 5 + 5)
+  • Cycles Per Instruction (CPI): 27 / 5 = 5.40 CPI
+
+
+================================================================================
+5. SUMMARY & ARCHITECTURAL BENEFITS OF VERSION 3.1
+================================================================================
+
+1. Dual Granularity Support:
+   Developers can observe execution both cycle-by-cycle via `vm.tick()` for
+   micro-architectural verification and instruction-by-instruction via `vm.step()`.
+
+2. Authentic Cycle Counting:
+   Clock cycle counts reflect real hardware latency: memory-accessing instructions
+   (like LD) require additional bus cycles compared to pure register ALU operations.
+
+3. Complete Educational Transparency:
+   Every micro-operation prints its exact clock tick number, active tri-state bus gate,
+   and register latch transition.
+================================================================================

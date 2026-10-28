@@ -1,0 +1,292 @@
+================================================================================
+     VERSION 2.3: MEDIATED MEMORY BUS INTERFACE & COMPLETE HARDWARE DATAPATH
+================================================================================
+
+1. OVERVIEW & PURPOSE
+---------------------
+Version 2.3 introduces the physical bus architecture of the CPU:
+`memory/bus-interface.js`.
+
+In real computer hardware, a CPU core does NOT have direct wires running to every
+byte inside a memory chip. Memory chips (SRAM, DRAM, ROM) are external components
+connected across three physical shared communication trunks called the SYSTEM BUS:
+1. The 16-bit Address Bus (driven by the CPU's MAR)
+2. The 16-bit Data Bus (bidirectional, driven by RAM during read or MDR during write)
+3. The Control Bus (`MemRead` and `MemWrite` strobes driven by the Control Unit)
+
+In earlier versions of our VM (Version 2.0, 2.1, and 2.2), even though `MAR` and `MDR`
+were defined as latches, the code still cheated in software by directly indexing
+the RAM array: `const loadedValue = vm.latches.latchMDR(vm.mem[vm.latches.MAR]);`.
+
+Version 2.3 completely eliminates this software shortcut. The CPU core has ZERO
+direct access to the RAM array. All memory transactions—both fetching instructions
+during Phase 1 (IF) and loading data during Phase 4 (MEM)—are strictly mediated
+through `MemoryBusInterface` using `MAR`, `MDR`, and the `MemRead` / `MemWrite`
+control lines.
+
+
+================================================================================
+2. HOW VERSION 2.3 DIFFERS FROM PREVIOUS VERSIONS
+================================================================================
+
+Feature                    v2.0 (Software)  v2.1 (Storage)   v2.2 (CU & ALU)  v2.3 (Mediated Bus)
+-------------------------  ---------------  ---------------  ---------------  -------------------
+General-Purpose Regs       `reg[0..7]`      `RegisterFile`   `RegisterFile`   `RegisterFile`
+Internal CPU Latches       None             Latches (MAR..)  Latches (MAR..)  Latches (MAR..)
+Control Unit Signals       None             None             `ControlUnit`    `ControlUnit`
+Arithmetic Unit (ALU)      JS `+` operator  JS `+` operator  Dedicated `ALU`  Dedicated `ALU`
+Memory Storage             `new Uint16Array` `new Uint16Array` `new Uint16Array` Encapsulated in RAM
+Memory Access Method       `mem[addr]`      `mem[MAR]`       `mem[MAR]`       `bus.readCycle(latches, MemRead)`
+Memory Bus Protocol        None             None             None             Address, Data & Control Bus
+Read/Write Control Lines   None             None             Flags only       Gated hardware strobes
+RAM Direct Indexing        Allowed          Allowed          Allowed          FORBIDDEN (Mediated only)
+
+
+================================================================================
+3. THE MEMORY BUS INTERFACE IN DETAIL (`memory/bus-interface.js`)
+================================================================================
+
+A. PHYSICAL HARDWARE ANALOGY
+----------------------------
+A physical memory chip has:
+• 16 Address Pins (A0 to A15) connected to the Address Bus.
+• 16 Data Pins (D0 to D15) connected to the Data Bus.
+• Output Enable / Read Pin (`OE` / `MemRead`) connected to the Control Bus.
+• Write Enable Pin (`WE` / `MemWrite`) connected to the Control Bus.
+
+When neither `MemRead` nor `MemWrite` is active, the data pins enter a High-Impedance
+state (High-Z / disconnected), and the bus is IDLE.
+
+B. READ BUS CYCLE (`bus.readCycle(latches, memRead)`)
+-----------------------------------------------------
+1. Gating Check: Checks that the `MemRead` control wire is asserted HIGH (`true`).
+   - If `MemRead === false`, the bus cycle is aborted, RAM output drivers remain
+     in High-Z, and the transaction is recorded as IDLE.
+2. Address Phase: The bus interface reads the 16-bit address from the CPU's `MAR`
+   latch, driving the Address Bus lines.
+3. Memory Read Phase: The internal RAM array decodes the address and places the
+   16-bit stored word onto the Data Bus lines.
+4. Latching Phase: The data arriving on the Data Bus is latched into the CPU's `MDR`
+   register.
+5. Bus Logging: Records a full transaction record (`{ type: 'READ', address, data, memRead: true }`).
+
+C. WRITE BUS CYCLE (`bus.writeCycle(latches, memWrite)`)
+-------------------------------------------------------
+1. Gating Check: Checks that the `MemWrite` control wire is asserted HIGH (`true`).
+   - If `MemWrite === false`, RAM ignores the bus and no data is written.
+2. Address Phase: Reads address from `MAR` and drives the Address Bus.
+3. Data Phase: Reads data from `MDR` and drives the Data Bus.
+4. Write Phase: RAM asserts the internal write pulse, storing the data word into
+   the memory location at `MAR`.
+5. Bus Logging: Records `{ type: 'WRITE', address, data, memWrite: true }`.
+
+D. DIRECT INITIALIZATION LOADER (`bus.loadEntries(entries)`)
+------------------------------------------------------------
+Models flashing a ROM chip or using a Direct Memory Access (DMA) hardware loader
+to write program binary bytes into RAM before the CPU is released from reset.
+
+
+================================================================================
+4. THE 5-PHASE HARDWARE CYCLE WITH BUS TRANSACTIONS
+================================================================================
+
+```
++---------------------------------------------------------------------------------+
+|                                 FETCH (IF)                                      |
+| 1. MAR <= PC (CPU drives MAR)                                                   |
+| 2. MemoryBus.readCycle(latches, MemRead=true)                                   |
+|    Address Bus <= MAR  |  RAM decodes  |  Data Bus <= RAM[MAR]  |  MDR <= Data  |
+| 3. IR <= MDR (Instruction word latched from MDR)                                |
+| 4. PC <= PC + 1                                                                 |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                                 DECODE (ID)                                     |
+| ControlUnit asserts: RegWrite, ALUSrc, MemRead, MemWrite, MemToReg, ALUOp, SetCC |
+| RegFile reads: Port A <= R[SR1]  |  Port B <= R[SR2]                            |
+| SEXT units: SEXT5(imm5) / SEXT9(PCoffset9)                                      |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                                 EXECUTE (EX)                                    |
+| ALUSrc MUX selects ALU Input B (Port B or SEXT immediate)                       |
+| ALU computes: ALU_Out = ALU.compute(Input A, Input B, ALUOp)                    |
+| Address Adder computes Effective Address = PC + Offset (for LD)                 |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                                 MEMORY (MEM)                                    |
+| For LD:                                                                         |
+|   1. MAR <= Effective Address                                                   |
+|   2. MemoryBus.readCycle(latches, Control.MemRead=true)                         |
+|      Address Bus <= MAR  |  Data Bus <= RAM[MAR]  |  MDR <= Data                |
+| For ADD:                                                                        |
+|   MemoryBus.readCycle(latches, Control.MemRead=false) -> Bus remains IDLE       |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                               WRITE-BACK (WB)                                   |
+| MemToReg MUX selects write data: ALU_Out (if MemToReg=0) or MDR (if MemToReg=1) |
+| If RegWrite == 1: RegFile latches write data into R[DR]                         |
+| If SetCC == 1: PSR latches condition codes from ALU flags / loaded data         |
++---------------------------------------------------------------------------------+
+```
+
+
+================================================================================
+5. COMPLETE STEP-BY-STEP WORKFLOW WITH A FULL EXAMPLE
+================================================================================
+
+Consider the program assembled at `0x3000` (`12288` decimal):
+
+  Line 1: LD R1, #25       ; Step 1: PC-relative load from literal pool
+  Line 2: ADD R0, R1, #5   ; Step 2: Immediate-mode addition: R0 = R1 + 5 = 30
+  Line 3: ADD R2, R1, R0   ; Step 3: Register-mode addition: R2 = R1 + R0 = 25 + 30 = 55
+
+Memory Layout in RAM:
+  Address 12288 (0x3000) : `0010 001 000000010` (LD R1, Offset +2)
+  Address 12289 (0x3001) : `0001 000 001 1 00101` (ADD R0, R1, #5)
+  Address 12290 (0x3002) : `0001 010 001 000 000` (ADD R2, R1, R0)
+  Address 12291 (0x3003) : Literal Data Word -> `25` (0x0019)
+
+--------------------------------------------------------------------------------
+STEP 1: `LD R1, #25` (PC-relative Load)
+--------------------------------------------------------------------------------
+Initial State: PC=12288, all registers=0, PSR=0b010 (ZERO)
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12288). Address 12288 is latched into MAR.
+  • The CPU triggers the Memory Bus: `bus.readCycle(latches, MemRead: ENABLED)`.
+    - Address Bus carries address `12288`.
+    - Control Bus asserts `MemRead: HIGH`.
+    - RAM responds on Data Bus with `0010 001 000000010` (`0x2202`).
+    - MDR captures `0x2202` from Data Bus.
+  • IR <= MDR (`0x2202` is latched in IR).
+  • PC is incremented: `PC <= 12288 + 1 = 12289`.
+
+Phase 2 (ID - Instruction Decode & Control Assertion):
+  • Decoder extracts: Opcode=0010 (LD), DR=R1, PCoffset9=+2.
+  • ControlUnit asserts:
+    RegWrite=1, ALUSrc=IMM, MemRead=1, MemWrite=0, MemToReg=1, ALUOp=ADD, SetCC=1.
+  • SEXT9 sign-extends offset `+2`.
+
+Phase 3 (EX - Execute / Address Calculation):
+  • Address Adder computes: Target Address = PC (12289) + Offset (+2) = 12291.
+
+Phase 4 (MEM - Memory Access via Memory Bus):
+  • MAR <= Target Address (12291).
+  • The CPU triggers the Memory Bus: `bus.readCycle(latches, Control.MemRead: ENABLED)`.
+    - Address Bus carries `12291`.
+    - Control Bus asserts `MemRead: HIGH`.
+    - RAM retrieves literal word `25` from address 12291 and drives the Data Bus.
+    - MDR captures `25` from the Data Bus.
+
+Phase 5 (WB - Write-Back & Status Update):
+  • `MemToReg MUX` has select line `1`, so it selects `MDR` (25).
+  • Register File Write Port receives `25` for destination `R1`.
+  • `RegWrite == 1`: R1 latches `25`.
+  • `SetCC == 1`: Condition detector evaluates 25 (positive) -> PSR <= `0b001` [P].
+
+State after Step 1:
+  Latches       : PC=12289, IR=0x2202, MAR=12291, MDR=25, PSR=0b001 [P]
+  Memory Bus    : Last transaction was READ at address 12291, data=25
+  Register File : R0=0, R1=25, R2=0, R3=0, R4=0, R5=0, R6=0, R7=0
+
+--------------------------------------------------------------------------------
+STEP 2: `ADD R0, R1, #5` (Immediate-Mode Addition)
+--------------------------------------------------------------------------------
+Initial State: PC=12289, R1=25, other registers=0
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12289).
+  • `bus.readCycle(latches, MemRead: ENABLED)`.
+    - Address Bus carries `12289`.
+    - RAM outputs `0001 000 001 1 00101` (`0x10A5`) onto Data Bus.
+    - MDR captures `0x10A5`.
+  • IR <= MDR (`0x10A5`).
+  • PC <= 12289 + 1 = 12290.
+
+Phase 2 (ID - Instruction Decode & Control Assertion):
+  • Decoder extracts: Opcode=0001 (ADD), DR=R0, SR1=R1, ImmFlag=1, Imm5=+5.
+  • ControlUnit asserts:
+    RegWrite=1, ALUSrc=IMM, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1.
+  • Register File Read Port A reads R1 -> outputs `25`.
+  • SEXT5 sign-extends immediate: `+5`.
+
+Phase 3 (EX - Execute / ALU):
+  • `ALUSrc MUX` selects immediate `+5` (because ALUSrc='IMM').
+  • ALU computes: Input A (`25`) + Input B (`5`) = `30`.
+  • ALU evaluates flags: 30 > 0 -> POSITIVE [P].
+
+Phase 4 (MEM - Memory Access via Memory Bus):
+  • The CPU triggers the Memory Bus with `Control.MemRead: FALSE`:
+    - `bus.readCycle(latches, false)`.
+    - Control wire `MemRead` is INACTIVE.
+    - Address and Data buses remain completely IDLE.
+
+Phase 5 (WB - Write-Back & Status Update):
+  • `MemToReg MUX` selects `ALU_Out` (`30`) because MemToReg=0.
+  • `RegWrite == 1`: Register File R0 latches `30`.
+  • `SetCC == 1`: PSR latches `0b001` [P].
+
+State after Step 2:
+  Latches       : PC=12290, IR=0x10A5, MAR=12289, MDR=4261, PSR=0b001 [P]
+  Memory Bus    : IDLE (MemRead=0, MemWrite=0)
+  Register File : R0=30, R1=25, R2=0, R3=0, R4=0, R5=0, R6=0, R7=0
+
+--------------------------------------------------------------------------------
+STEP 3: `ADD R2, R1, R0` (Register-Mode Addition)
+--------------------------------------------------------------------------------
+Initial State: PC=12290, R0=30, R1=25, other registers=0
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12290).
+  • `bus.readCycle(latches, MemRead: ENABLED)`.
+    - Address Bus carries `12290`.
+    - RAM outputs `0001 010 001 000 000` (`0x1440`) onto Data Bus.
+    - MDR captures `0x1440`.
+  • IR <= MDR (`0x1440`).
+  • PC <= 12290 + 1 = 12291.
+
+Phase 2 (ID - Instruction Decode & Control Assertion):
+  • Decoder extracts: Opcode=0001 (ADD), DR=R2, SR1=R1, ImmFlag=0, SR2=R0.
+  • ControlUnit asserts:
+    RegWrite=1, ALUSrc=REG, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1.
+  • Register File Read Port A reads R1 -> outputs `25`.
+  • Register File Read Port B reads R0 -> outputs `30`.
+
+Phase 3 (EX - Execute / ALU):
+  • `ALUSrc MUX` selects Port B (`30`) because ALUSrc='REG'.
+  • ALU computes: Input A (`25`) + Input B (`30`) = `55`.
+  • ALU evaluates flags: 55 > 0 -> POSITIVE [P].
+
+Phase 4 (MEM - Memory Access via Memory Bus):
+  • Memory Bus is IDLE (`MemRead=0, MemWrite=0`).
+
+Phase 5 (WB - Write-Back & Status Update):
+  • `MemToReg MUX` selects `ALU_Out` (`55`) because MemToReg=0.
+  • `RegWrite == 1`: Register File R2 latches `55`.
+  • `SetCC == 1`: PSR latches `0b001` [P].
+
+State after Step 3:
+  Latches       : PC=12291, IR=0x1440, MAR=12290, MDR=5184, PSR=0b001 [P]
+  Memory Bus    : IDLE (MemRead=0, MemWrite=0)
+  Register File : R0=30, R1=25, R2=55, R3=0, R4=0, R5=0, R6=0, R7=0
+
+
+================================================================================
+6. WHY THIS ARCHITECTURE MIRRORS REAL SILICON
+================================================================================
+By mediating all memory interactions through `MemoryBusInterface`:
+1. Physical Isolation: The CPU core is physically isolated from the RAM array.
+   It cannot touch RAM without driving MAR, asserting a control line, and latching MDR.
+2. Bus Protocol Fidelity: Read and Write cycles are synchronous operations governed
+   by explicit control signals (`MemRead`, `MemWrite`).
+3. Electrical Realism: When no memory operation is requested (e.g. during an ADD
+   instruction's MEM stage), the bus enters an explicit IDLE state.
+4. Complete 5-Phase Hardware Cycle: Every instruction follows the exact path of
+   a classical RISC/von Neumann microprocessor pipeline.

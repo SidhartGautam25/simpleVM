@@ -1,0 +1,319 @@
+================================================================================
+     VERSION 2.4: CPU PIPELINE & SEQUENTIAL 5-PHASE HARDWARE ORCHESTRATION
+================================================================================
+
+1. OVERVIEW & PURPOSE
+---------------------
+Version 2.4 introduces the classical 5-stage CPU datapath orchestrator:
+`cpu/cpu-pipeline.js`.
+
+In real microprocessors (such as LC-3, MIPS, and RISC-V), a CPU does NOT execute an
+instruction through an ad-hoc monolithic software function. Instead, every single
+instruction progresses through 5 strictly defined, sequential micro-architectural
+phases:
+
+  1. phaseFetch()     (IF)  - Instruction Fetch
+  2. phaseDecode()    (ID)  - Instruction Decode & Operand Read
+  3. phaseExecute()   (EX)  - ALU Execution & Effective Address Calculation
+  4. phaseMemory()    (MEM) - Mediated Memory Bus Access (via MAR and MDR)
+  5. phaseWriteBack() (WB)  - Destination Register Update & PSR Status Latching
+
+In Version 2.3 and prior versions, while hardware components like `RegisterFile`,
+`Latches`, `ControlUnit`, `ALU`, and `MemoryBusInterface` existed, the execution flow
+remained fragmented. `vm.step()` performed fetch, and then individual instruction
+handlers (`handleAdd`, `handleLd`) executed the remaining stages together in one
+monolithic handler.
+
+Version 2.4 refactors the entire execution datapath into a unified, modular hardware
+pipeline (`CpuPipeline`). Each of the 5 phases is implemented as a dedicated method
+that processes pipeline registers and produces standardized stage packets:
+`this.stageRegisters.IF`, `ID`, `EX`, `MEM`, and `WB`.
+
+
+================================================================================
+2. HOW VERSION 2.4 DIFFERS FROM PREVIOUS VERSIONS
+================================================================================
+
+Feature                    v2.1 (Storage)   v2.2 (CU & ALU)  v2.3 (Bus)       v2.4 (CPU Pipeline)
+-------------------------  ---------------  ---------------  ---------------  -------------------
+Storage & Latches          Dedicated        Dedicated        Dedicated        Dedicated
+Control Unit Signals       None             `ControlUnit`    `ControlUnit`    `ControlUnit`
+Arithmetic Unit (ALU)      JS `+`           Dedicated `ALU`  Dedicated `ALU`  Dedicated `ALU`
+RAM Access Model           Direct array     Direct array     Mediated Bus     Mediated Bus
+Execution Architecture     Monolithic VM    Monolithic VM    Split Handlers   Unified `CpuPipeline`
+5-Phase Methods            None             Conceptual only  Conceptual only  Strictly Separated:
+                                                                              • phaseFetch()
+                                                                              • phaseDecode()
+                                                                              • phaseExecute()
+                                                                              • phaseMemory()
+                                                                              • phaseWriteBack()
+Inter-Stage Registers      None             None             None             IF, ID, EX, MEM, WB
+Single-Stage Testing       Impossible       Impossible       Impossible       Fully Independent
+
+
+================================================================================
+3. THE 5 CPU PIPELINE PHASES IN DETAIL (`cpu/cpu-pipeline.js`)
+================================================================================
+
+Each phase mirrors the physical hardware circuits activated on a processor clock:
+
+--------------------------------------------------------------------------------
+PHASE 1: INSTRUCTION FETCH (IF) -> `phaseFetch()`
+--------------------------------------------------------------------------------
+Hardware Operations:
+  1. The Program Counter (PC) value is copied to the Memory Address Register:
+     `MAR <= PC` (Drives the 16-bit Address Bus).
+  2. The Control Unit asserts `MemRead = true` on the Control Bus.
+  3. The `MemoryBusInterface` places the RAM word onto the Data Bus, which is latched
+     into the Memory Data Register: `MDR <= RAM[MAR]`.
+  4. The Instruction Register latches the instruction word from MDR:
+     `IR <= MDR`.
+  5. The PC incrementer computes the address of the sequential instruction:
+     `PC <= (PC + 1) & 0xFFFF`.
+
+Stage Packet Output:
+  `{ stage: 'IF', pc, nextPc, rawInstruction, hardwareEvents }`
+
+--------------------------------------------------------------------------------
+PHASE 2: INSTRUCTION DECODE & REGISTER READ (ID) -> `phaseDecode(ifStage)`
+--------------------------------------------------------------------------------
+Hardware Operations:
+  1. `InstructionDecoder` slices the 16-bit IR word into bitfields:
+     Opcode (bits 15:12), DR (bits 11:9), SR1 (bits 8:6), mode bit (bit 5),
+     SR2 (bits 2:0) or imm5 (bits 4:0), and pcOffset9 (bits 8:0).
+  2. The `ControlUnit` combinational logic evaluates the opcode to assert control lines:
+     • `RegWrite` : Enables writing to Register File in WB stage.
+     • `ALUSrc`   : MUX selector between Register File Port B and SEXT immediate.
+     • `MemRead`  : Enables RAM read cycle in MEM stage.
+     • `MemWrite` : Enables RAM write cycle in MEM stage.
+     • `MemToReg` : MUX selector between MDR and ALU output in WB stage.
+     • `ALUOp`    : ALU function code ('ADD').
+     • `SetCC`    : Enables latching condition flags into PSR in WB stage.
+  3. `RegisterFile` Read Ports:
+     • Read Port A is driven by SR1 address lines -> outputs `sr1Val`.
+     • Read Port B is driven by SR2 address lines -> outputs `sr2Val` (if reg mode).
+  4. Sign-Extension Unit (SEXT):
+     • SEXT5 sign-extends 5-bit immediate to 16 bits.
+     • SEXT9 sign-extends 9-bit PC-relative offset to 16 bits.
+
+Stage Packet Output:
+  `{ stage: 'ID', pc, nextPc, rawInstruction, decoded, control, sr1Val, sr2Val, hardwareEvents }`
+
+--------------------------------------------------------------------------------
+PHASE 3: EXECUTION & ADDRESS CALCULATION (EX) -> `phaseExecute(idStage)`
+--------------------------------------------------------------------------------
+Hardware Operations:
+  1. ALUSrc Multiplexer:
+     • If `ALUSrc === 'REG'`: routes `sr2Val` to ALU input B.
+     • If `ALUSrc === 'IMM'`: routes sign-extended `imm5` to ALU input B.
+  2. ALU Arithmetic Computation:
+     • For `ADD`: computes `ALU_Out = sr1Val + aluInputB (mod 65536)`.
+     • Evaluates hardware condition flags: Negative (N), Zero (Z), Positive (P).
+  3. Address Calculation (for PC-relative loads):
+     • For `LD`: computes `Effective Address = nextPc + SEXT9(pcOffset9)` using the ALU.
+
+Stage Packet Output:
+  `{ stage: 'EX', ..., aluInputA, aluInputB, aluOutput, effectiveAddress, hardwareEvents }`
+
+--------------------------------------------------------------------------------
+PHASE 4: MEMORY ACCESS (MEM) -> `phaseMemory(exStage)`
+--------------------------------------------------------------------------------
+Hardware Operations:
+  1. If `MemRead === true` (e.g. `LD` instruction):
+     • `MAR <= effectiveAddress` (Drives Address Bus).
+     • `MemoryBusInterface.readCycle(latches, true)` executes a read transaction.
+     • Memory data placed on Data Bus and latched into `MDR`.
+  2. If `MemWrite === true` (e.g. `ST` instruction):
+     • `MAR <= effectiveAddress` (Drives Address Bus).
+     • `MemoryBusInterface.writeCycle(latches, true)` writes `MDR` into `RAM[MAR]`.
+  3. If neither (`MemRead === false, MemWrite === false`, e.g. `ADD` instruction):
+     • `MemoryBusInterface.readCycle(latches, false)` records bus as `IDLE`.
+     • Neither Address Bus nor Data Bus is asserted.
+
+Stage Packet Output:
+  `{ stage: 'MEM', ..., loadedValue, hardwareEvents }`
+
+--------------------------------------------------------------------------------
+PHASE 5: WRITE-BACK & STATUS UPDATE (WB) -> `phaseWriteBack(memStage)`
+--------------------------------------------------------------------------------
+Hardware Operations:
+  1. MemToReg Multiplexer:
+     • If `MemToReg === true`: selects `MDR` (data fetched from memory).
+     • If `MemToReg === false`: selects `ALU_Out` (computed arithmetic result).
+  2. Register File Write:
+     • If `RegWrite === true`: drives write data to `RegisterFile.write(DR, writeData)`.
+     • Destination register `R[DR]` latches the new 16-bit word.
+  3. Processor Status Register (PSR):
+     • If `SetCC === true`:
+       - If loaded from memory: flags evaluated on loaded data (`ALU.evaluateFlags(MDR)`).
+       - If computed by ALU: flags taken directly from `aluOutput.flags`.
+       - PSR latches the 3-bit condition code `(N, Z, P)`.
+
+Stage Packet Output:
+  `{ stage: 'WB', ..., writeData, writeRecord, hardwareEvents }`
+
+
+================================================================================
+4. COMPLETE WORKFLOW EXAMPLE WALKTHROUGH
+================================================================================
+
+Consider the execution of 3 representative instructions:
+  1. `LD R1, #25`      (Load literal from memory via PC-relative address)
+  2. `ADD R0, R1, #5`   (Immediate addition)
+  3. `ADD R2, R1, R0`   (Register-to-register addition)
+
+Program Memory Layout:
+  Address 12288 (0x3000): LD R1, #25       (0b0010_001_000000010 = 0x2202)
+  Address 12289 (0x3001): ADD R0, R1, #5   (0b0001_000_001_1_00101 = 0x1065)
+  Address 12290 (0x3002): ADD R2, R1, R0   (0b0001_010_001_000_000 = 0x1440)
+  Address 12291 (0x3003): Literal 25       (stored in literal pool)
+
+
+--------------------------------------------------------------------------------
+INSTRUCTION 1: LD R1, #25 (At Address 12288)
+--------------------------------------------------------------------------------
+
+[PHASE 1: phaseFetch()]
+  • MAR <= PC (12288). Address Bus driven with 12288.
+  • Control Bus asserts MemRead = true.
+  • Memory Bus Interface reads RAM[12288] (0x2202) -> Data Bus -> MDR <= 0x2202.
+  • Instruction Register latches MDR: IR <= 0x2202.
+  • PC incremented: PC <= 12289.
+
+[PHASE 2: phaseDecode()]
+  • IR (0x2202) decoded: Opcode = 0010 (LD), DR = R1, pcOffset9 = +2.
+  • Control Unit asserts:
+      RegWrite=1, ALUSrc=IMM, MemRead=1, MemWrite=0, MemToReg=1, ALUOp=ADD, SetCC=1.
+  • Sign-Extension Unit SEXT9: PCoffset9 <= +2.
+
+[PHASE 3: phaseExecute()]
+  • Address Adder computes Effective Address:
+      ALU Input A: PC after fetch (12289)
+      ALU Input B: SEXT9 offset (+2)
+      ALU Output : 12289 + 2 = 12291.
+      Effective Address = 12291.
+
+[PHASE 4: phaseMemory()]
+  • Control signal MemRead is active (1).
+  • MAR <= 12291 (Drives Address Bus).
+  • Memory Bus Interface reads RAM[12291] (25) -> Data Bus -> MDR <= 25.
+
+[PHASE 5: phaseWriteBack()]
+  • MemToReg MUX selects MDR (25) because MemToReg = 1.
+  • Register File Write Port enables write: R1 <= 25.
+  • Value 25 is positive (> 0) -> PSR latches 0b001 (POSITIVE [P]).
+
+End of Instruction 1 State:
+  R1 = 25, PC = 12289, PSR = [P], MAR = 12291, MDR = 25.
+
+
+--------------------------------------------------------------------------------
+INSTRUCTION 2: ADD R0, R1, #5 (At Address 12289)
+--------------------------------------------------------------------------------
+
+[PHASE 1: phaseFetch()]
+  • MAR <= PC (12289). Address Bus driven with 12289.
+  • Control Bus asserts MemRead = true.
+  • Memory Bus Interface reads RAM[12289] (0x1065) -> Data Bus -> MDR <= 0x1065.
+  • IR <= 0x1065.
+  • PC <= 12290.
+
+[PHASE 2: phaseDecode()]
+  • IR (0x1065) decoded: Opcode = 0001 (ADD), DR = R0, SR1 = R1, immFlag = 1, imm5 = +5.
+  • Control Unit asserts:
+      RegWrite=1, ALUSrc=IMM, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1.
+  • Register File Port A reads R1 -> outputs 25.
+  • SEXT5 sign-extends imm5 -> outputs +5.
+
+[PHASE 3: phaseExecute()]
+  • ALUSrc MUX selects sign-extended immediate (+5) because ALUSrc = IMM.
+  • ALU Input A = 25 (from SR1).
+  • ALU Input B = 5 (from SEXT5).
+  • ALU computes: 25 + 5 = 30.
+  • ALU evaluates flags: 30 > 0 -> Positive = true.
+
+[PHASE 4: phaseMemory()]
+  • Control signals: MemRead = 0, MemWrite = 0.
+  • Memory Bus Interface remains IDLE (no bus lines driven).
+
+[PHASE 5: phaseWriteBack()]
+  • MemToReg MUX selects ALU Output (30) because MemToReg = 0.
+  • Register File Write Port enables write: R0 <= 30.
+  • PSR latches 0b001 (POSITIVE [P]).
+
+End of Instruction 2 State:
+  R0 = 30, R1 = 25, PC = 12290, PSR = [P].
+
+
+--------------------------------------------------------------------------------
+INSTRUCTION 3: ADD R2, R1, R0 (At Address 12290)
+--------------------------------------------------------------------------------
+
+[PHASE 1: phaseFetch()]
+  • MAR <= PC (12290). Address Bus driven with 12290.
+  • Control Bus asserts MemRead = true.
+  • Memory Bus Interface reads RAM[12290] (0x1440) -> MDR <= 0x1440 -> IR <= 0x1440.
+  • PC <= 12291.
+
+[PHASE 2: phaseDecode()]
+  • IR (0x1440) decoded: Opcode = 0001 (ADD), DR = R2, SR1 = R1, immFlag = 0, SR2 = R0.
+  • Control Unit asserts:
+      RegWrite=1, ALUSrc=REG, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1.
+  • Register File Read Port A reads R1 -> outputs 25.
+  • Register File Read Port B reads R0 -> outputs 30.
+
+[PHASE 3: phaseExecute()]
+  • ALUSrc MUX selects Register File Port B (30) because ALUSrc = REG.
+  • ALU computes: 25 + 30 = 55.
+  • ALU evaluates flags: 55 > 0 -> Positive = true.
+
+[PHASE 4: phaseMemory()]
+  • MemRead = 0, MemWrite = 0 -> Memory Bus is IDLE.
+
+[PHASE 5: phaseWriteBack()]
+  • MemToReg MUX selects ALU Output (55).
+  • Register File Write Port enables write: R2 <= 55.
+  • PSR latches 0b001 (POSITIVE [P]).
+
+End of Instruction 3 State:
+  R0 = 30, R1 = 25, R2 = 55, PC = 12291, PSR = [P].
+
+
+================================================================================
+5. SUMMARY & ARCHITECTURAL BENEFITS OF VERSION 2.4
+================================================================================
+
+1. Exact Hardware Correspondence:
+   Every function (`phaseFetch`, `phaseDecode`, `phaseExecute`, `phaseMemory`, `phaseWriteBack`)
+   has an exact physical counterpart in real processor silicon.
+
+2. Clean Separation of Responsibilities:
+   The Instruction Handler no longer contains monolithic execution code. The CPU
+   Pipeline coordinates the entire datapath flow systematically.
+
+3. Standalone Verification:
+   Each phase can be tested in isolation (e.g. testing `phaseDecode` on a specific bit pattern
+   without running memory cycles, or verifying `phaseMemory` idle states).
+
+4. Foundation for Clock-Cycle Simulation:
+   Because the state between phases is encapsulated in `this.stageRegisters`, this
+   design directly supports pipeline hazards, stalls, forwarding, and multi-cycle execution.
+================================================================================
+
+1. Exact Hardware Correspondence:
+   Every function (`phaseFetch`, `phaseDecode`, `phaseExecute`, `phaseMemory`, `phaseWriteBack`)
+   has an exact physical counterpart in real processor silicon.
+
+2. Clean Separation of Responsibilities:
+   The Instruction Handler no longer contains monolithic execution code. The CPU
+   Pipeline coordinates the entire datapath flow systematically.
+
+3. Standalone Verification:
+   Each phase can be tested in isolation (e.g. testing `phaseDecode` on a specific bit pattern
+   without running memory cycles, or verifying `phaseMemory` idle states).
+
+4. Foundation for Clock-Cycle Simulation:
+   Because the state between phases is encapsulated in `this.stageRegisters`, this
+   design directly supports pipeline hazards, stalls, forwarding, and multi-cycle execution.
+================================================================================
+

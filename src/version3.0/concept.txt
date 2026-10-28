@@ -1,0 +1,324 @@
+================================================================================
+         COMPUTER ARCHITECTURE THEORY & CONCEPTS: VERSION 3.0
+  THE CENTRAL INTERNAL DATAPATH BUS & DUAL STORAGE ARCHITECTURE (GPRs vs. LATCHES)
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Introduction & Overview: What Are These Topics?
+2. The Motivating Problem: Why Do These Concepts Exist?
+3. In-Depth Architectural & Electrical Theory
+   A. The Wiring Explosion Problem: O(N^2) Point-to-Point vs. O(N) Shared Bus
+   B. Tri-State Logic: The Third State (High-Impedance / High-Z)
+   C. Electrical Bus Contention & The One-Hot Gating Rule
+   D. Dual Storage Architecture: General-Purpose Registers vs. Internal Latches
+   E. The 3-Bit Addressability Limit & The "Software Emulator Myth"
+4. How Real Silicon Hardware Works (With Structural Diagrams)
+   A. Comprehensive Datapath Diagram of the Central Internal Bus
+   B. Datapath Multiplexing & Control Line Signal Flow
+   C. Step-by-Step Electrical Flow for Memory Loads and ALU Computations
+5. How These Concepts Assist Program Execution
+6. Implementation in Version 3.0 Codebase
+   A. `cpu/internal-bus.js` (The Central Datapath Bus)
+   B. `cpu/control-unit.js` (Tri-State Gates & Load Enables)
+   C. `storage/register-file.js` vs. `storage/latches.js` (Physical Storage Separation)
+   D. Integration in `cpu/cpu-pipeline.js` and `cpu/instruction-describer.js`
+
+
+================================================================================
+1. INTRODUCTION & OVERVIEW: WHAT ARE THESE TOPICS?
+================================================================================
+
+This document provides a comprehensive, hardware-accurate theoretical exploration
+of two foundational pillars of computer engineering implemented in Version 3.0:
+
+1. The Central 16-bit Internal CPU Datapath Bus (`InternalBus`):
+   The shared electrical superhighway inside the processor core that interconnects
+   the arithmetic execution units (ALU, Address Adder), temporary latches (PC, IR,
+   MAR, MDR, PSR), and the register file.
+
+2. Tri-State Gating & Load Enables:
+   The physical electronic mechanism—consisting of tri-state buffers and gated clock
+   latches—that allows multiple digital circuits to share a single set of parallel
+   wires without causing electrical short circuits or data corruption.
+
+3. Dual Storage Architecture (GPRs vs. Dedicated Internal CPU Latches):
+   The fundamental separation in silicon between the Programmer-Visible General-
+   Purpose Register File (R0 through R7) and the Processor-Internal Micro-Architectural
+   Latches (PC, IR, MAR, MDR, PSR).
+
+
+================================================================================
+2. THE MOTIVATING PROBLEM: WHY DO THESE CONCEPTS EXIST?
+================================================================================
+
+Imagine building a CPU where every single component that produces data has a
+dedicated bundle of 16 copper wires running directly to every component that
+consumes data.
+
+If a CPU contains $N$ components (PC, IR, MAR, MDR, ALU, Register File, Address Adder,
+Condition Code logic), the number of point-to-point connections grows with:
+                     Interconnections = N * (N - 1) = O(N^2)
+
+For 8 major functional units, this requires 56 separate 16-bit wiring bundles, or
+nearly 900 physical copper traces crisscrossing the microchip die!
+This creates:
+  • Massive silicon die area consumed entirely by interconnect routing ("wire routing bottleneck").
+  • Severe parasitic capacitance, slowing down clock frequency and consuming excessive power.
+  • Enormous multiplexer networks at every input port to select which wire to listen to.
+
+THE HARDWARE SOLUTION: THE CENTRAL INTERNAL COMMON BUS
+Instead of routing hundreds of dedicated wires, engineers lay down ONE shared
+trunk of 16 parallel metallic traces running through the center of the CPU core:
+the Central Internal Datapath Bus. Every module taps into this single bus.
+
+However, sharing one set of wires introduces a catastrophic electrical danger:
+If two components try to output different voltages onto the same wire at the same
+time (one driving 5V/HIGH and the other driving 0V/LOW), a dead short circuit occurs,
+destroying transistors or burning out the chip.
+
+This necessitated the invention of **Tri-State Logic** and the strict **One-Hot Bus
+Gating Rule**.
+
+
+================================================================================
+3. IN-DEPTH ARCHITECTURAL & ELECTRICAL THEORY
+================================================================================
+
+--------------------------------------------------------------------------------
+A. TRI-STATE LOGIC: THE THIRD ELECTRICAL STATE (High-Z)
+--------------------------------------------------------------------------------
+Standard digital logic gates have only two output states:
+  • Logic 0: Low voltage (0V / Ground). Actively pulls the line down.
+  • Logic 1: High voltage (e.g. +3.3V or +5V). Actively drives the line up.
+
+Because both Logic 0 and Logic 1 are active, low-impedance connections to the power
+rails, two standard outputs connected together will fight each other.
+
+To solve this, hardware engineers designed the **Tri-State Buffer**:
+```
+                 Tri-State Enable (Gate)
+                          │
+                          ▼
+            Input ───────▷─────── Output (Connected to Central Bus)
+```
+
+The tri-state buffer has three possible output states:
+  1. Gate = 1, Input = 0  ───> Output = 0 (Drives 0V)
+  2. Gate = 1, Input = 1  ───> Output = 1 (Drives 5V)
+  3. Gate = 0             ───> Output = High-Impedance (High-Z / "Disconnected")
+
+In the High-Z state, the output transistors are completely turned OFF. The buffer
+behaves as if an open physical switch exists between the component and the bus wire.
+It draws virtually zero current and exerts zero electrical influence on the line.
+
+--------------------------------------------------------------------------------
+B. ELECTRICAL BUS CONTENTION & THE ONE-HOT GATING RULE
+--------------------------------------------------------------------------------
+Because multiple tri-state buffers tap into the Central Bus, the CPU Control Unit
+must obey the absolute physical constraint:
+
+                 ONE-HOT GATING RULE:
+                 Exactly ONE tri-state driver may be enabled (Gate = 1)
+                 at any given instant. All other drivers MUST be in High-Z (Gate = 0).
+
+Drivers on the LC-3 Central Datapath Bus:
+  • `GatePC`     : Connects PC latch output to Central Bus.
+  • `GateMDR`    : Connects MDR latch output to Central Bus.
+  • `GateALU`    : Connects ALU output bus to Central Bus.
+  • `GateMARMUX` : Connects Effective Address Adder to Central Bus.
+
+Destination Load Enables (Reading from the Central Bus):
+While only ONE component can DRIVE the bus, multiple components can safely READ
+from the bus simultaneously by asserting their Load Enable lines:
+  • `LD_MAR` : Memory Address Register latches the word on the bus.
+  • `LD_IR`  : Instruction Register latches the word on the bus.
+  • `LD_REG` : Register File destination register R[DR] latches the word on the bus.
+  • `LD_CC`  : Condition Code logic evaluates the bus word and updates PSR (N, Z, P).
+
+--------------------------------------------------------------------------------
+C. DUAL STORAGE ARCHITECTURE: GPRs vs. INTERNAL CPU LATCHES
+--------------------------------------------------------------------------------
+Why does a computer have both a `RegisterFile` (R0 through R7) and separate
+`Latches` (PC, IR, MAR, MDR, PSR)?
+
+1. The General-Purpose Register File (GPRs - R0 through R7):
+   • These are **Programmer-Visible Registers**.
+   • The software compiler and assembly programmer explicitly reference them in code
+     (e.g., `ADD R0, R1, R2`).
+   • In physical silicon, the Register File is implemented as a multi-ported SRAM
+     block. To conserve silicon area and routing, it shares common read and write ports.
+     To read R1, the CPU drives the binary address `001` onto the Port A address lines.
+     To write R3, the CPU drives `011` onto the write address lines and pulses `writeEnable`.
+
+2. The Dedicated Internal CPU Latches (PC, IR, MAR, MDR, PSR):
+   • These are **Micro-Architectural Registers**.
+   • They are completely invisible to standard assembly instructions. The programmer
+     cannot write `ADD PC, R1, R2` or `LD MAR, #5`.
+   • Each latch is built as a standalone 16-bit array of edge-triggered D flip-flops
+     with **hardwired, dedicated functional connections**:
+     - `PC`  : Output is permanently routed to the PC-incrementer adder.
+     - `IR`  : 16 output wires physically fan out directly into the instruction
+               decoder logic (bits 15:12 into opcode PLA, bits 11:9 into DR selector, etc.).
+               If IR were in the Register File, these control wires could not be
+               continuously driven!
+     - `MAR` : 16 output pins physically exit the CPU core to drive the memory Address Bus.
+     - `MDR` : Bidirectional transceiver pins directly interface with the memory Data Bus.
+     - `PSR` : 3 discrete flip-flops holding condition codes N, Z, and P, wired directly
+               to branch multiplexers.
+
+--------------------------------------------------------------------------------
+D. THE 3-BIT ADDRESSABILITY LIMIT & THE "SOFTWARE EMULATOR MYTH"
+--------------------------------------------------------------------------------
+In early educational software or simplified hobbyist emulators, programmers often
+declared:
+     `const reg = new Uint16Array(10); // R0-R7, reg[8]=PC, reg[9]=PSR`
+
+While convenient in software, **this is physically impossible in silicon**:
+  • The LC-3 instruction word is exactly 16 bits wide.
+  • The register fields (`DR`, `SR1`, `SR2`) are strictly allocated **3 bits** each.
+  • 3 binary bits can only represent $2^3 = 8$ distinct combinations:
+       000 (R0), 001 (R1), 010 (R2), 011 (R3),
+       100 (R4), 101 (R5), 110 (R6), 111 (R7).
+  • An instruction physically CANNOT address a "Register 8" or "Register 9"!
+
+Therefore, keeping `RegisterFile` and `Latches` separate is not an arbitrary design
+choice; it is the **only architecture faithful to physical hardware**.
+`latchPC()` does NOT write into the Register File because PC is not a GPR.
+
+
+================================================================================
+4. HOW REAL SILICON HARDWARE WORKS (WITH STRUCTURAL DIAGRAMS)
+================================================================================
+
+--------------------------------------------------------------------------------
+A. CENTRAL INTERNAL DATAPATH BUS ARCHITECTURE DIAGRAM
+--------------------------------------------------------------------------------
+
+```
+                 =================================================
+                            CENTRAL 16-BIT INTERNAL BUS
+                 =================================================
+                     ▲              ▲             ▲             ▲
+                     │              │             │             │
+                  [GatePC]      [GateMDR]     [GateALU]    [GateMARMUX]
+                     │              │             │             │
+               ┌─────┴─────┐  ┌─────┴─────┐ ┌─────┴─────┐ ┌─────┴─────┐
+               │    PC     │  │    MDR    │ │    ALU    │ │Addr Adder │
+               │  Counter  │  │   Latch   │ │  Output   │ │ (MARMUX)  │
+               └───────────┘  └─────▲─────┘ └─────▲─────┘ └───────────┘
+                     │              │             │
+                     │         [External]    ┌────┴────────────┐
+                     │         [Data Bus]    │ ALUSrc MUX      │
+                     │              │        ├────────┬────────┤
+                     │              ▼        │ Port B │ SEXT5  │
+                     │        ┌───────────┐  └────▲───┴───▲────┘
+                     │        │ External  │       │       │
+                     │        │  Memory   │       │   [from IR]
+                     │        └─────▲─────┘       │
+                     │              │             │ Read Port B
+                     │        [Address Bus]  ┌────┴────────────┐
+                     │              │        │  REGISTER FILE  │
+                     │        ┌─────┴─────┐  │   (R0 - R7)     │
+                     │        │    MAR    │  │                 │
+                     │        │   Latch   │  │ Read    Write   │
+                     │        └─────▲─────┘  │ Port A  Port DR │
+                     │              │        └────┬───────▲────┘
+                     │              │             │       │
+                     ▼              │             ▼       │
+                  [LD_MAR]──────────┼─────────────┘       │
+                  [LD_IR]───────────┼─────────────────────┤
+                  [LD_REG]──────────┼─────────────────────┘
+                  [LD_CC]───────────┴───────────────► [PSR Latch]
+```
+
+--------------------------------------------------------------------------------
+B. HOW DATA TRANSFERS OCCUR ACROSS THE BUS
+--------------------------------------------------------------------------------
+Every legitimate transfer of data between storage units inside the CPU requires
+coordinating one driver and at least one receiver:
+
+1. PC to MAR Transfer (during Instruction Fetch):
+   • Control Unit asserts: `GatePC = 1, LD_MAR = 1`.
+   • All other `Gate*` lines are 0 (High-Z).
+   • PC voltage appears on Central Bus -> MAR flip-flops capture the bus voltage.
+
+2. MDR to Register File DR Transfer (during Memory Load `LD`):
+   • Data arrives from external RAM over external Data Bus into MDR.
+   • Control Unit asserts: `GateMDR = 1, LD_REG = 1, LD_CC = 1`.
+   • MDR drives Central Bus -> Register File decoder routes bus data into R[DR].
+   • Condition Code logic evaluates Central Bus data and sets N, Z, or P in PSR.
+
+3. ALU Output to Register File DR Transfer (during Arithmetic `ADD`):
+   • ALU computes `SR1 + Operand2`.
+   • Control Unit asserts: `GateALU = 1, LD_REG = 1, LD_CC = 1`.
+   • ALU output drives Central Bus -> Register File captures bus into R[DR].
+   • PSR captures condition flags.
+
+
+================================================================================
+5. HOW THESE CONCEPTS ASSIST PROGRAM EXECUTION
+================================================================================
+
+1. Deterministic Micro-Architectural Control:
+   By standardizing all data movement through tri-state gating, the Control Unit
+   can be completely defined as a truth table (or ROM microcode) that maps opcodes
+   to simple 1-bit control wires (`Gate*`, `LD_*`).
+
+2. Eliminates Timing Race Conditions:
+   Data is placed onto the bus and stabilizes before destination latches are clocked,
+   preventing unpredictable glitching.
+
+3. Modular Scalability:
+   Adding a new functional unit (e.g., a hardware Multiplier, Barrel Shifter, or
+   Floating Point Unit) requires only:
+     - Tapping its output to the Central Bus through a tri-state buffer (`GateFPU`).
+     - Tapping its inputs from the Central Bus via a load enable (`LD_FPU`).
+     - No redesign of the Register File or memory interface is required!
+
+
+================================================================================
+6. IMPLEMENTATION IN VERSION 3.0 CODEBASE
+================================================================================
+
+--------------------------------------------------------------------------------
+A. `src/version3.0/src/cpu/internal-bus.js`
+--------------------------------------------------------------------------------
+Models the 16-bit Central Internal Datapath Bus:
+  • `this.value` : 16-bit unsigned integer representing the voltage on the bus wires.
+  • `this.driver`: Name of the active tri-state driver ('PC', 'MDR', 'ALU', 'MARMUX', or null).
+  • `drive(sourceName, val)`: Simulates asserting a `Gate*` signal. Validates and latches
+    the word, recording the driver component for telemetry.
+  • `read()`: Simulates tapping data off the bus wires when a `LD_*` line is high.
+  • `float()`: Simulates all tri-state buffers turning off (High-Z state).
+
+--------------------------------------------------------------------------------
+B. `src/version3.0/src/cpu/control-unit.js`
+--------------------------------------------------------------------------------
+Emits explicit tri-state bus gating lines and destination load enables alongside
+traditional control signals:
+  • For `ADD`:
+    `GateALU: true, GateMDR: false, LD_REG: true, LD_CC: true`
+  • For `LD`:
+    `GateMDR: true, GateALU: false, GateMARMUX: true, LD_MAR: true, LD_REG: true, LD_CC: true`
+
+--------------------------------------------------------------------------------
+C. `src/version3.0/src/storage/register-file.js` & `latches.js`
+--------------------------------------------------------------------------------
+Maintains strict physical silicon separation:
+  • `RegisterFile`: Exclusively holds R0-R7 with dual read ports and gated write port.
+  • `Latches`: Exclusively holds PC, IR, MAR, MDR, and PSR.
+  • They are unlinked in storage and communicate ONLY via `InternalBus`.
+
+--------------------------------------------------------------------------------
+D. Step Description Telemetry (`src/version3.0/src/cpu/instruction-describer.js`)
+--------------------------------------------------------------------------------
+Every instruction execution step output explicitly details:
+  1. The Central Internal Bus transfer:
+     `Central Bus Transfer : GateMDR asserts MDR onto Central Bus -> LD_REG latches into R1`
+  2. The distinct storage categories:
+     `• Latches (Dedicated CPU Registers) : PC:12289 ... MAR:12293 MDR:25 PSR:0b001`
+     `• Register File (General-Purpose)   : R0:0 R1:25 R2:0 ...`
+     `• Central Internal Datapath Bus     : BUS <= MDR (25)`
+================================================================================
+

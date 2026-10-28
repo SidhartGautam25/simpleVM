@@ -1,0 +1,191 @@
+================================================================================
+     VERSION 3.0: CENTRAL INTERNAL DATAPATH BUS & STORAGE ARCHITECTURE
+================================================================================
+
+1. ARCHITECTURAL FOUNDATION: WHY DOES THE CPU HAVE TWO STORAGE INTERFACES?
+--------------------------------------------------------------------------
+A common source of confusion in early software emulators is treating all registers
+as a single flat array:
+    `const reg = new Uint16Array(10); // R0-R7, reg[8]=PC, reg[9]=PSR`  <-- SOFTWARE HACK!
+
+In real silicon microprocessors, **there is NO Register 8 or Register 9**:
+  • The LC-3 / RISC instruction format allocates **3 bits** for register addresses.
+  • With 3 bits, you can only address registers $000_2$ to $111_2$ (R0 through R7).
+  • An instruction literally has NO physical bit pattern to address PC, IR, or MAR.
+    You cannot write `ADD PC, R1, R2` in assembly.
+
+Therefore, real silicon microprocessors contain **TWO PHYSICALLY DISTINCT** storage
+blocks:
+
+A. General-Purpose Register File (`RegisterFile` - R0 through R7):
+   • Multi-ported SRAM cell array.
+   • Selected strictly via 3-bit instruction bitfields: DR (Destination Register),
+     SR1 (Source Register 1), and SR2 (Source Register 2).
+   • Has dual read ports (Port A and Port B) and a gated write port.
+   • Programmer-visible general storage.
+
+B. Dedicated Internal CPU Latches (`Latches` - PC, IR, MAR, MDR, PSR):
+   • Standalone 16-bit flip-flop registers, each with dedicated physical wiring:
+     - Program Counter (PC): Hardwired to the PC incrementer and branch adder.
+     - Instruction Register (IR): 16 physical copper traces continuously fan out
+       to drive the Control Unit opcode decoder and operand field selectors.
+     - Memory Address Register (MAR): Physical output pins directly drive the
+       external memory Address Bus.
+     - Memory Data Register (MDR): Bidirectional interface pins connect to the
+       external memory Data Bus.
+     - Processor Status Register (PSR): Dedicated 3-bit flip-flops holding
+       condition flags (Negative, Zero, Positive).
+
+Because PC is a dedicated hardware latch and NOT a General-Purpose Register,
+`latchPC()` must NEVER write into the `RegisterFile`. Doing so would violate real
+hardware architecture.
+
+
+================================================================================
+2. HOW ARE `RegisterFile` AND `Latches` PHYSICALLY LINKED?
+================================================================================
+
+In real hardware, `Latches` and `RegisterFile` are NOT linked by sharing code or
+internal memory arrays. 
+
+Instead, they are physically connected across a shared trunk called the:
+**CENTRAL 16-BIT INTERNAL CPU BUS (`InternalBus`)**.
+
+Every component that can supply data connects to this bus through a **Tri-State Buffer**:
+  • `GatePC`     : Drives the Program Counter onto the Central Bus.
+  • `GateMDR`    : Drives the Memory Data Register onto the Central Bus.
+  • `GateALU`    : Drives the ALU Output onto the Central Bus.
+  • `GateMARMUX` : Drives calculated effective addresses onto the Central Bus.
+
+**Hardware One-Hot Rule (No Bus Contention)**:
+Only ONE `Gate*` line may be asserted at any given time. If two components drive
+the bus simultaneously, a physical electrical short circuit (bus contention) occurs.
+
+Every component that can receive data latches from this bus when its **Load Enable**
+signal is pulsed HIGH:
+  • `LD_MAR` : MAR captures the Central Bus (used to set the memory address).
+  • `LD_IR`  : IR captures the Central Bus (used to load a new instruction word).
+  • `LD_REG` : `RegisterFile[DR]` captures the Central Bus (used in Write-Back).
+  • `LD_CC`  : `PSR` evaluates condition flags from the Central Bus.
+
+
+================================================================================
+3. EVOLUTION ACROSS VERSIONS
+================================================================================
+
+Feature                    v2.1 (Storage)   v2.3 (Memory Bus) v2.4 (5-Phases)  v3.0 (Central Bus)
+-------------------------  ---------------  ----------------- ---------------  -------------------
+Register File (R0-R7)      `RegisterFile`   `RegisterFile`    `RegisterFile`   `RegisterFile`
+Hardware Latches (PC..)    `Latches`        `Latches`         `Latches`        `Latches`
+External Memory Bus        Direct array     `MemoryBus`       `MemoryBus`      `MemoryBus`
+Datapath Orchestrator      Monolithic VM    Monolithic VM     `CpuPipeline`    `CpuPipeline`
+5-Phase Methods            None             None              Strictly Split   Strictly Split
+Data Transfer Mechanism    JS variables     JS variables      JS variables     **Central 16-bit Bus**
+Tri-State Gating           None             None              None             **GatePC, GateMDR, GateALU**
+Gated Loading              None             None              None             **LD_MAR, LD_IR, LD_REG, LD_CC**
+Latch-to-GPR Link          Unlinked         Unlinked          Unlinked         **Unified via Central Bus**
+
+
+================================================================================
+4. COMPLETE 5-PHASE TRACE OF CENTRAL BUS TRANSFERS
+================================================================================
+
+Consider two representative operations:
+  Instruction 1: `LD R1, #25`  (Load literal from memory into R1)
+  Instruction 2: `ADD R0, R1, #5` (Immediate addition into R0)
+
+--------------------------------------------------------------------------------
+INSTRUCTION 1: `LD R1, #25` (PC = 12288)
+--------------------------------------------------------------------------------
+
+[PHASE 1: phaseFetch()]
+  1. Central Bus: `GatePC = 1` -> `BUS <= PC (12288)`.
+  2. Latch: `LD_MAR = 1` -> `MAR <= BUS (12288)`. MAR drives external Address Bus.
+  3. External Memory Bus: `MemRead = true` -> RAM[12288] (0x2202) -> MDR <= 0x2202.
+  4. Central Bus: `GateMDR = 1` -> `BUS <= MDR (0x2202)`.
+  5. Latch: `LD_IR = 1` -> `IR <= BUS (0x2202)` (Instruction word latched).
+  6. Incrementer: `PC <= 12289`.
+
+[PHASE 2: phaseDecode()]
+  1. InstructionDecoder splits IR (0x2202): Opcode = LD, DR = R1, pcOffset9 = +2.
+  2. ControlUnit asserts control & bus signals:
+     `RegWrite = 1, LD_REG = 1, ALUSrc = IMM, MemRead = 1, GateMDR = 1, GateMARMUX = 1, LD_MAR = 1, LD_CC = 1`.
+  3. SEXT9 sign-extends offset to +2.
+
+[PHASE 3: phaseExecute()]
+  1. Address Adder computes: `Effective Address = PC (12289) + Offset (+2) = 12291`.
+
+[PHASE 4: phaseMemory()]
+  1. Central Bus: `GateMARMUX = 1` -> `BUS <= 12291`.
+  2. Latch: `LD_MAR = 1` -> `MAR <= BUS (12291)`. MAR drives external Address Bus.
+  3. External Memory Bus: `MemRead = true` -> RAM[12291] reads literal 25 -> `MDR <= 25`.
+
+[PHASE 5: phaseWriteBack()]
+  1. Central Bus: `GateMDR = 1` -> `BUS <= MDR (25)`.
+     (Data from the dedicated MDR latch is placed onto the Central Bus!)
+  2. Register File: `LD_REG = 1` -> Write Port enables `RegisterFile[R1] <= BUS (25)`.
+     (The GPR captures data directly from the Central Bus!)
+  3. Latch: `LD_CC = 1` -> `PSR <= EvaluateFlags(BUS (25))` -> PSR <= 0b001 [P].
+
+End of Step State:
+  Latches: PC=12289, IR=0x2202, MAR=12291, MDR=25, PSR=[P]
+  Register File: R1 = 25
+  Central Internal Bus: BUS <= MDR (25)
+
+
+--------------------------------------------------------------------------------
+INSTRUCTION 2: `ADD R0, R1, #5` (PC = 12289)
+--------------------------------------------------------------------------------
+
+[PHASE 1: phaseFetch()]
+  1. Central Bus: `GatePC = 1` -> `BUS <= PC (12289)`.
+  2. Latch: `LD_MAR = 1` -> `MAR <= BUS (12289)`.
+  3. External Memory Bus: reads RAM[12289] -> `MDR <= 0x1065`.
+  4. Central Bus: `GateMDR = 1` -> `BUS <= MDR (0x1065)`.
+  5. Latch: `LD_IR = 1` -> `IR <= BUS (0x1065)`.
+  6. Incrementer: `PC <= 12290`.
+
+[PHASE 2: phaseDecode()]
+  1. InstructionDecoder splits IR (0x1065): Opcode = ADD, DR = R0, SR1 = R1, imm5 = +5.
+  2. ControlUnit asserts signals:
+     `RegWrite = 1, LD_REG = 1, ALUSrc = IMM, GateALU = 1, GateMDR = 0, ALUOp = ADD, LD_CC = 1`.
+  3. Register File Read Port A reads `R1` (current value = 25).
+  4. SEXT5 sign-extends immediate to +5.
+
+[PHASE 3: phaseExecute()]
+  1. ALUSrc MUX selects SEXT5 immediate (+5).
+  2. ALU computes: `25 + 5 = 30`. Condition flags: `Positive = true`.
+
+[PHASE 4: phaseMemory()]
+  1. `MemRead = 0, MemWrite = 0` -> External Memory Bus is IDLE.
+
+[PHASE 5: phaseWriteBack()]
+  1. Central Bus: `GateALU = 1` -> `BUS <= ALU_Out (30)`.
+     (ALU drives its result onto the Central Bus!)
+  2. Register File: `LD_REG = 1` -> Write Port enables `RegisterFile[R0] <= BUS (30)`.
+     (Destination register R0 captures the value from the Central Bus!)
+  3. Latch: `LD_CC = 1` -> `PSR <= EvaluateFlags(BUS (30))` -> PSR <= 0b001 [P].
+
+End of Step State:
+  Latches: PC=12290, IR=0x1065, MAR=12289, MDR=0x1065, PSR=[P]
+  Register File: R0 = 30, R1 = 25
+  Central Internal Bus: BUS <= ALU (30)
+
+
+================================================================================
+5. SUMMARY: WHAT HAS BEEN RESOLVED
+================================================================================
+
+1. Architectural Separation is Preserved:
+   `RegisterFile` (R0-R7) and `Latches` (PC, IR, MAR, MDR, PSR) remain physically
+   distinct as required by real hardware silicon.
+
+2. Explicit Datapath Linkage:
+   They are no longer separate software modules passing JavaScript objects.
+   Every data interaction between them is mediated by the **Central Internal Datapath Bus**
+   with tri-state `Gate*` drivers and destination `LD_*` enables.
+
+3. Full Visibility in Step Descriptions:
+   Every instruction step description explicitly prints the Central Internal Bus
+   transactions, giving the user complete hardware-level transparency.
+================================================================================
