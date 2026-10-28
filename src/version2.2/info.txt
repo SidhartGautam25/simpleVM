@@ -1,0 +1,524 @@
+================================================================================
+           VERSION 2.2: CONTROL UNIT, ALU & HARDWARE DATAPATH INTEGRATION
+================================================================================
+
+1. OVERVIEW & PURPOSE
+---------------------
+Version 2.2 completes the hardware architecture by introducing the brain and
+calculator of the CPU:
+1. `ControlUnit` (`cpu/control-unit.js`): Combinational decoding logic that generates
+   all micro-architectural control wire signals (`RegWrite`, `ALUSrc`, `MemRead`,
+   `MemWrite`, `MemToReg`, `ALUOp`, `SetCC`).
+2. `ALU` (`cpu/alu.js`): 16-bit Arithmetic Logic Unit with combinational zero
+   and sign-bit detection that generates hardware condition flags (N, Z, P).
+3. Unified Hardware Datapath: Connects the `RegisterFile` and `Latches` (from v2.1)
+   to the `ALU` and `ControlUnit` via physical hardware multiplexers (MUXes),
+   completely eliminating ad-hoc JavaScript arithmetic and software branching.
+
+
+================================================================================
+2. HOW VERSION 2.2 DIFFERS FROM VERSION 2.1
+================================================================================
+
+Feature                    Version 2.1                      Version 2.2 (Integrated Datapath)
+-------------------------  -------------------------------  -------------------------------------------
+Control Logic              Software `if/else` checks        Dedicated `ControlUnit` asserting wires
+Arithmetic Execution       JavaScript `+` operator          Dedicated 16-bit `ALU` module
+Operand B Selection        JavaScript conditional check     `ALUSrc` Multiplexer (Port B vs SEXT5 Imm)
+Write-Back Data Selection  Direct variable assignment       `MemToReg` Multiplexer (ALU_Out vs MDR)
+Condition Flag Generation  Ad-hoc helper function           ALU combinational zero & sign detectors
+Hardware Automation        Storage-level only               Full datapath: Control + ALU + Storage
+
+
+================================================================================
+3. THE NEW HARDWARE MODULES IN DETAIL
+================================================================================
+
+A. THE CONTROL UNIT (`cpu/control-unit.js`)
+-------------------------------------------
+In a physical processor, the Control Unit is a combinational logic circuit. It
+examines the 4-bit Opcode in `IR[15:12]` (and mode bits like `IR[5]`) and asserts
+control wire signals that configure all multiplexers, enables, and functional units
+across the chip:
+
+Control Wire Signal        Meaning / Hardware Action When Asserted
+-------------------------  -------------------------------------------------------------
+`RegWrite` (1 bit)         1 = Destination register (DR) latches write-back data.
+                           0 = Register File ignores data (no register modified).
+`ALUSrc` ('REG' | 'IMM')   'REG' = ALUSrc MUX selects Register File Read Port B (SR2).
+                           'IMM' = ALUSrc MUX selects sign-extended immediate/offset.
+`MemRead` (1 bit)          1 = Memory bus strobes RAM to read word at MAR into MDR.
+                           0 = Memory bus inactive.
+`MemWrite` (1 bit)         1 = Memory bus writes MDR into RAM at address MAR.
+                           0 = Memory bus inactive.
+`MemToReg` (1 bit)         0 = MemToReg MUX routes ALU_Out to Register File Write Port.
+                           1 = MemToReg MUX routes MDR data to Register File Write Port.
+`ALUOp` ('ADD' | 'NONE')   Tells the ALU which operation to perform.
+`SetCC` (1 bit)            1 = Processor Status Register (PSR) latches new condition flags.
+
+Control Signals Generated per Instruction:
+• ADD (Register Mode) : RegWrite=1, ALUSrc=REG, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1
+• ADD (Immediate Mode): RegWrite=1, ALUSrc=IMM, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1
+• LD  (PC-relative)   : RegWrite=1, ALUSrc=IMM, MemRead=1, MemWrite=0, MemToReg=1, ALUOp=ADD, SetCC=1
+
+B. THE ARITHMETIC LOGIC UNIT (`cpu/alu.js`)
+--------------------------------------------
+The ALU is the hardware component that performs computations. It takes two 16-bit
+inputs (`inputA`, `inputB`) and an operation code (`op`), and produces:
+1. `result`: 16-bit unsigned result, clamped using 16-bit modulo arithmetic (`& 0xFFFF`).
+2. Hardware Condition Flags:
+   - `Negative (N)`: High (1) if bit 15 (most significant bit / sign bit) of result is 1.
+   - `Zero (Z)`    : High (1) if all 16 bits of result are 0.
+   - `Positive (P)`: High (1) if bit 15 is 0 and the result is non-zero.
+   - `psrFlag`     : The corresponding 3-bit mask (`0b100`, `0b010`, or `0b001`).
+
+C. DATAPATH MULTIPLEXERS (MUXes)
+---------------------------------
+1. `ALUSrc` MUX:
+   - Input 0: Value from Register File Read Port B (`SR2`).
+   - Input 1: Sign-extended immediate value (`SEXT5(imm5)`).
+   - Control: Selected by `ControlUnit.ALUSrc`. Output feeds directly into ALU Input B.
+2. `MemToReg` MUX:
+   - Input 0: `ALU_Out` (computation result from ALU).
+   - Input 1: `MDR` (data read from memory).
+   - Control: Selected by `ControlUnit.MemToReg`. Output feeds directly into Register File Write Port.
+
+
+================================================================================
+4. THE COMPLETE 5-PHASE HARDWARE CYCLE IN VERSION 2.2
+================================================================================
+
+```
++---------------------------------------------------------------------------------+
+|                                 FETCH (IF)                                      |
+| MAR <= PC   |   MDR <= RAM[MAR]   |   IR <= MDR   |   PC <= PC + 1                  |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                                 DECODE (ID)                                     |
+| ControlUnit asserts: RegWrite, ALUSrc, MemRead, MemWrite, MemToReg, ALUOp, SetCC |
+| RegFile reads: Port A <= R[SR1]  |  Port B <= R[SR2]                            |
+| SEXT units: SEXT5(imm5) / SEXT9(PCoffset9)                                      |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                                 EXECUTE (EX)                                    |
+| ALUSrc MUX selects ALU Input B (Port B or SEXT immediate)                       |
+| ALU computes: ALU_Out = ALU.compute(Input A, Input B, ALUOp)                    |
+| ALU evaluates condition flags: N, Z, P                                          |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                                 MEMORY (MEM)                                    |
+| If MemRead == 1: MAR <= Target Address, MDR <= RAM[MAR]                         |
+| If MemWrite == 1: RAM[MAR] <= MDR                                               |
+| If MemRead == 0 and MemWrite == 0: Memory Bus is IDLE                           |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                               WRITE-BACK (WB)                                   |
+| MemToReg MUX selects write data: ALU_Out (if MemToReg=0) or MDR (if MemToReg=1) |
+| If RegWrite == 1: RegFile latches write data into R[DR]                         |
+| If SetCC == 1: PSR latches condition codes from ALU flags / loaded data         |
++---------------------------------------------------------------------------------+
+```
+
+
+================================================================================
+5. COMPLETE STEP-BY-STEP WALKTHROUGH WITH A FULL EXAMPLE
+================================================================================
+
+Consider the following program assembled at memory location `0x3000` (`12288`):
+
+  Line 1: LD R1, #25       ; Step 1: Loads 25 into R1
+  Line 2: ADD R0, R1, #5   ; Step 2: Immediate ADD: R0 = R1 + 5 = 30
+  Line 3: ADD R2, R1, R0   ; Step 3: Register ADD : R2 = R1 + R0 = 25 + 30 = 55
+
+Memory Layout:
+  Address 12288 (0x3000) : `0010 001 000000010` (LD R1, Offset +2)
+  Address 12289 (0x3001) : `0001 000 001 1 00101` (ADD R0, R1, #5)
+  Address 12290 (0x3002) : `0001 010 001 000 000` (ADD R2, R1, R0)
+  Address 12291 (0x3003) : Literal Pool -> Value 25
+
+--------------------------------------------------------------------------------
+STEP 1: `LD R1, #25` (PC-relative Load)
+--------------------------------------------------------------------------------
+Initial State: PC=12288, all registers=0, PSR=0b010 (ZERO)
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12288)
+  • MDR <= RAM[12288] (reads `0010 001 000000010`)
+  • IR  <= MDR (`0x2202`)
+  • PC  <= PC + 1 = 12289
+
+Phase 2 (ID - Instruction Decode & Control Assertion):
+  • Decoder extracts: Opcode=0010 (LD), DR=R1, PCoffset9=+2
+  • ControlUnit asserts:
+    RegWrite=1, ALUSrc=IMM, MemRead=1, MemWrite=0, MemToReg=1, ALUOp=ADD, SetCC=1
+  • SEXT9 sign-extends offset: `+2`
+
+Phase 3 (EX - Execute / Address Calculation):
+  • Address Adder calculates: Effective Address = PC (12289) + Offset (+2) = 12291
+
+Phase 4 (MEM - Memory Access):
+  • Because `MemRead == 1`:
+    - MAR <= 12291 (driven onto Address Bus)
+    - MDR <= RAM[12291] (reads the literal data `25` into MDR)
+
+Phase 5 (WB - Write-Back & Status Update):
+  • `MemToReg MUX` has select line `1`, so it selects `MDR` (25)
+  • Register File Write Port receives `25` for destination `R1`
+  • Because `RegWrite == 1`: R1 latches `25`
+  • Because `SetCC == 1`: ALU flags for 25 evaluate to POSITIVE -> PSR <= `0b001` [P]
+
+End of Step 1 State:
+  Latches       : PC=12289, IR=0x2202, MAR=12291, MDR=25, PSR=0b001 [P]
+  Register File : R0=0, R1=25, R2=0, R3=0, R4=0, R5=0, R6=0, R7=0
+
+--------------------------------------------------------------------------------
+STEP 2: `ADD R0, R1, #5` (Immediate-Mode Addition)
+--------------------------------------------------------------------------------
+Initial State: PC=12289, R1=25, other registers=0
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12289)
+  • MDR <= RAM[12289] (reads `0001 000 001 1 00101` / `0x10A5`)
+  • IR  <= MDR (`0x10A5`)
+  • PC  <= PC + 1 = 12290
+
+Phase 2 (ID - Instruction Decode & Control Assertion):
+  • Decoder extracts: Opcode=0001 (ADD), DR=R0, SR1=R1, ImmFlag=1, Imm5=+5
+  • ControlUnit asserts:
+    RegWrite=1, ALUSrc=IMM, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1
+  • Register File Read Port A reads R1 -> outputs `25`
+  • SEXT5 sign-extends 5-bit immediate: `+5`
+
+Phase 3 (EX - Execute / ALU):
+  • `ALUSrc MUX` has select line `IMM`, so it routes immediate `+5` into ALU Input B
+  • ALU Input A = `25`, ALU Input B = `5`, Operation = `ADD`
+  • ALU computes: `25 + 5 = 30`
+  • ALU condition detector: 30 > 0 -> Flags: N=0, Z=0, P=1 (PSR flag = `0b001`)
+
+Phase 4 (MEM - Memory Access):
+  • Because `MemRead == 0` and `MemWrite == 0`: Memory Bus is IDLE
+
+Phase 5 (WB - Write-Back & Status Update):
+  • `MemToReg MUX` has select line `0`, so it routes `ALU_Out` (30) to Write Port
+  • Because `RegWrite == 1`: R0 latches `30`
+  • Because `SetCC == 1`: PSR latches `0b001` [P]
+
+End of Step 2 State:
+  Latches       : PC=12290, IR=0x10A5, MAR=12289, MDR=4261, PSR=0b001 [P]
+  Register File : R0=30, R1=25, R2=0, R3=0, R4=0, R5=0, R6=0, R7=0
+
+--------------------------------------------------------------------------------
+STEP 3: `ADD R2, R1, R0` (Register-Mode Addition)
+--------------------------------------------------------------------------------
+Initial State: PC=12290, R0=30, R1=25, other registers=0
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12290)
+  • MDR <= RAM[12290] (reads `0001 010 001 000 000` / `0x1440`)
+  • IR  <= MDR (`0x1440`)
+  • PC  <= PC + 1 = 12291
+
+Phase 2 (ID - Instruction Decode & Control Assertion):
+  • Decoder extracts: Opcode=0001 (ADD), DR=R2, SR1=R1, ImmFlag=0, SR2=R0
+  • ControlUnit asserts:
+    RegWrite=1, ALUSrc=REG, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1
+  • Register File Read Port A reads R1 -> outputs `25`
+  • Register File Read Port B reads R0 -> outputs `30`
+
+Phase 3 (EX - Execute / ALU):
+  • `ALUSrc MUX` has select line `REG`, so it routes Port B (`30`) into ALU Input B
+  • ALU Input A = `25`, ALU Input B = `30`, Operation = `ADD`
+  • ALU computes: `25 + 30 = 55`
+  • ALU condition detector: 55 > 0 -> Flags: N=0, Z=0, P=1 (PSR flag = `0b001`)
+
+Phase 4 (MEM - Memory Access):
+  • Memory Bus is IDLE (`MemRead=0, MemWrite=0`)
+
+Phase 5 (WB - Write-Back & Status Update):
+  • `MemToReg MUX` has select line `0`, so it routes `ALU_Out` (55) to Write Port
+  • Because `RegWrite == 1`: R2 latches `55`
+  • Because `SetCC == 1`: PSR latches `0b001` [P]
+
+End of Step 3 State:
+  Latches       : PC=12291, IR=0x1440, MAR=12290, MDR=5184, PSR=0b001 [P]
+  Register File : R0=30, R1=25, R2=55, R3=0, R4=0, R5=0, R6=0, R7=0
+
+
+================================================================================
+6. SUMMARY OF ARCHITECTURAL ADVANCEMENTS IN VERSION 2.2
+================================================================================
+By introducing `ControlUnit` and `ALU`:
+1. Every micro-operation is governed by explicit binary control wires.
+2. Data selection is performed by physical multiplexers (`ALUSrc` and `MemToReg`).
+3. Arithmetic and status flags are computed exclusively inside the hardware ALU.
+4. The system is 100% faithful to true digital logic architecture without any
+   ad-hoc software shortcuts.
+
+1. OVERVIEW & PURPOSE
+---------------------
+Version 2.2 completes the hardware architecture by introducing the brain and
+calculator of the CPU:
+1. `ControlUnit` (`cpu/control-unit.js`): Combinational decoding logic that generates
+   all micro-architectural control wire signals (`RegWrite`, `ALUSrc`, `MemRead`,
+   `MemWrite`, `MemToReg`, `ALUOp`, `SetCC`).
+2. `ALU` (`cpu/alu.js`): 16-bit Arithmetic Logic Unit with combinational zero
+   and sign-bit detection that generates hardware condition flags (N, Z, P).
+3. Unified Hardware Datapath: Connects the `RegisterFile` and `Latches` (from v2.1)
+   to the `ALU` and `ControlUnit` via physical hardware multiplexers (MUXes),
+   completely eliminating ad-hoc JavaScript arithmetic and software branching.
+
+
+================================================================================
+2. HOW VERSION 2.2 DIFFERS FROM VERSION 2.1
+================================================================================
+
+Feature                    Version 2.1                      Version 2.2 (Integrated Datapath)
+-------------------------  -------------------------------  -------------------------------------------
+Control Logic              Software `if/else` checks        Dedicated `ControlUnit` asserting wires
+Arithmetic Execution       JavaScript `+` operator          Dedicated 16-bit `ALU` module
+Operand B Selection        JavaScript conditional check     `ALUSrc` Multiplexer (Port B vs SEXT5 Imm)
+Write-Back Data Selection  Direct variable assignment       `MemToReg` Multiplexer (ALU_Out vs MDR)
+Condition Flag Generation  Ad-hoc helper function           ALU combinational zero & sign detectors
+Hardware Automation        Storage-level only               Full datapath: Control + ALU + Storage
+
+
+================================================================================
+3. THE NEW HARDWARE MODULES IN DETAIL
+================================================================================
+
+A. THE CONTROL UNIT (`cpu/control-unit.js`)
+-------------------------------------------
+In a physical processor, the Control Unit is a combinational logic circuit. It
+examines the 4-bit Opcode in `IR[15:12]` (and mode bits like `IR[5]`) and asserts
+control wire signals that configure all multiplexers, enables, and functional units
+across the chip:
+
+Control Wire Signal        Meaning / Hardware Action When Asserted
+-------------------------  -------------------------------------------------------------
+`RegWrite` (1 bit)         1 = Destination register (DR) latches write-back data.
+                           0 = Register File ignores data (no register modified).
+`ALUSrc` ('REG' | 'IMM')   'REG' = ALUSrc MUX selects Register File Read Port B (SR2).
+                           'IMM' = ALUSrc MUX selects sign-extended immediate/offset.
+`MemRead` (1 bit)          1 = Memory bus strobes RAM to read word at MAR into MDR.
+                           0 = Memory bus inactive.
+`MemWrite` (1 bit)         1 = Memory bus writes MDR into RAM at address MAR.
+                           0 = Memory bus inactive.
+`MemToReg` (1 bit)         0 = MemToReg MUX routes ALU_Out to Register File Write Port.
+                           1 = MemToReg MUX routes MDR data to Register File Write Port.
+`ALUOp` ('ADD' | 'NONE')   Tells the ALU which operation to perform.
+`SetCC` (1 bit)            1 = Processor Status Register (PSR) latches new condition flags.
+
+Control Signals Generated per Instruction:
+• ADD (Register Mode) : RegWrite=1, ALUSrc=REG, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1
+• ADD (Immediate Mode): RegWrite=1, ALUSrc=IMM, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1
+• LD  (PC-relative)   : RegWrite=1, ALUSrc=IMM, MemRead=1, MemWrite=0, MemToReg=1, ALUOp=ADD, SetCC=1
+
+B. THE ARITHMETIC LOGIC UNIT (`cpu/alu.js`)
+--------------------------------------------
+The ALU is the hardware component that performs computations. It takes two 16-bit
+inputs (`inputA`, `inputB`) and an operation code (`op`), and produces:
+1. `result`: 16-bit unsigned result, clamped using 16-bit modulo arithmetic (`& 0xFFFF`).
+2. Hardware Condition Flags:
+   - `Negative (N)`: High (1) if bit 15 (most significant bit / sign bit) of result is 1.
+   - `Zero (Z)`    : High (1) if all 16 bits of result are 0.
+   - `Positive (P)`: High (1) if bit 15 is 0 and the result is non-zero.
+   - `psrFlag`     : The corresponding 3-bit mask (`0b100`, `0b010`, or `0b001`).
+
+C. DATAPATH MULTIPLEXERS (MUXes)
+---------------------------------
+1. `ALUSrc` MUX:
+   - Input 0: Value from Register File Read Port B (`SR2`).
+   - Input 1: Sign-extended immediate value (`SEXT5(imm5)`).
+   - Control: Selected by `ControlUnit.ALUSrc`. Output feeds directly into ALU Input B.
+2. `MemToReg` MUX:
+   - Input 0: `ALU_Out` (computation result from ALU).
+   - Input 1: `MDR` (data read from memory).
+   - Control: Selected by `ControlUnit.MemToReg`. Output feeds directly into Register File Write Port.
+
+
+================================================================================
+4. THE COMPLETE 5-PHASE HARDWARE CYCLE IN VERSION 2.2
+================================================================================
+
+```
++---------------------------------------------------------------------------------+
+|                                 FETCH (IF)                                      |
+| MAR <= PC   |   MDR <= RAM[MAR]   |   IR <= MDR   |   PC <= PC + 1                  |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                                 DECODE (ID)                                     |
+| ControlUnit asserts: RegWrite, ALUSrc, MemRead, MemWrite, MemToReg, ALUOp, SetCC |
+| RegFile reads: Port A <= R[SR1]  |  Port B <= R[SR2]                            |
+| SEXT units: SEXT5(imm5) / SEXT9(PCoffset9)                                      |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                                 EXECUTE (EX)                                    |
+| ALUSrc MUX selects ALU Input B (Port B or SEXT immediate)                       |
+| ALU computes: ALU_Out = ALU.compute(Input A, Input B, ALUOp)                    |
+| ALU evaluates condition flags: N, Z, P                                          |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                                 MEMORY (MEM)                                    |
+| If MemRead == 1: MAR <= Target Address, MDR <= RAM[MAR]                         |
+| If MemWrite == 1: RAM[MAR] <= MDR                                               |
+| If MemRead == 0 and MemWrite == 0: Memory Bus is IDLE                           |
++---------------------------------------------------------------------------------+
+                                       |
+                                       v
++---------------------------------------------------------------------------------+
+|                               WRITE-BACK (WB)                                   |
+| MemToReg MUX selects write data: ALU_Out (if MemToReg=0) or MDR (if MemToReg=1) |
+| If RegWrite == 1: RegFile latches write data into R[DR]                         |
+| If SetCC == 1: PSR latches condition codes from ALU flags / loaded data         |
++---------------------------------------------------------------------------------+
+```
+
+
+================================================================================
+5. COMPLETE STEP-BY-STEP WALKTHROUGH WITH A FULL EXAMPLE
+================================================================================
+
+Consider the following program assembled at memory location `0x3000` (`12288`):
+
+  Line 1: LD R1, #25       ; Step 1: Loads 25 into R1
+  Line 2: ADD R0, R1, #5   ; Step 2: Immediate ADD: R0 = R1 + 5 = 30
+  Line 3: ADD R2, R1, R0   ; Step 3: Register ADD : R2 = R1 + R0 = 25 + 30 = 55
+
+Memory Layout:
+  Address 12288 (0x3000) : `0010 001 000000010` (LD R1, Offset +2)
+  Address 12289 (0x3001) : `0001 000 001 1 00101` (ADD R0, R1, #5)
+  Address 12290 (0x3002) : `0001 010 001 000 000` (ADD R2, R1, R0)
+  Address 12291 (0x3003) : Literal Pool -> Value 25
+
+--------------------------------------------------------------------------------
+STEP 1: `LD R1, #25` (PC-relative Load)
+--------------------------------------------------------------------------------
+Initial State: PC=12288, all registers=0, PSR=0b010 (ZERO)
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12288)
+  • MDR <= RAM[12288] (reads `0010 001 000000010`)
+  • IR  <= MDR (`0x2202`)
+  • PC  <= PC + 1 = 12289
+
+Phase 2 (ID - Instruction Decode & Control Assertion):
+  • Decoder extracts: Opcode=0010 (LD), DR=R1, PCoffset9=+2
+  • ControlUnit asserts:
+    RegWrite=1, ALUSrc=IMM, MemRead=1, MemWrite=0, MemToReg=1, ALUOp=ADD, SetCC=1
+  • SEXT9 sign-extends offset: `+2`
+
+Phase 3 (EX - Execute / Address Calculation):
+  • Address Adder calculates: Effective Address = PC (12289) + Offset (+2) = 12291
+
+Phase 4 (MEM - Memory Access):
+  • Because `MemRead == 1`:
+    - MAR <= 12291 (driven onto Address Bus)
+    - MDR <= RAM[12291] (reads the literal data `25` into MDR)
+
+Phase 5 (WB - Write-Back & Status Update):
+  • `MemToReg MUX` has select line `1`, so it selects `MDR` (25)
+  • Register File Write Port receives `25` for destination `R1`
+  • Because `RegWrite == 1`: R1 latches `25`
+  • Because `SetCC == 1`: ALU flags for 25 evaluate to POSITIVE -> PSR <= `0b001` [P]
+
+End of Step 1 State:
+  Latches       : PC=12289, IR=0x2202, MAR=12291, MDR=25, PSR=0b001 [P]
+  Register File : R0=0, R1=25, R2=0, R3=0, R4=0, R5=0, R6=0, R7=0
+
+--------------------------------------------------------------------------------
+STEP 2: `ADD R0, R1, #5` (Immediate-Mode Addition)
+--------------------------------------------------------------------------------
+Initial State: PC=12289, R1=25, other registers=0
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12289)
+  • MDR <= RAM[12289] (reads `0001 000 001 1 00101` / `0x10A5`)
+  • IR  <= MDR (`0x10A5`)
+  • PC  <= PC + 1 = 12290
+
+Phase 2 (ID - Instruction Decode & Control Assertion):
+  • Decoder extracts: Opcode=0001 (ADD), DR=R0, SR1=R1, ImmFlag=1, Imm5=+5
+  • ControlUnit asserts:
+    RegWrite=1, ALUSrc=IMM, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1
+  • Register File Read Port A reads R1 -> outputs `25`
+  • SEXT5 sign-extends 5-bit immediate: `+5`
+
+Phase 3 (EX - Execute / ALU):
+  • `ALUSrc MUX` has select line `IMM`, so it routes immediate `+5` into ALU Input B
+  • ALU Input A = `25`, ALU Input B = `5`, Operation = `ADD`
+  • ALU computes: `25 + 5 = 30`
+  • ALU condition detector: 30 > 0 -> Flags: N=0, Z=0, P=1 (PSR flag = `0b001`)
+
+Phase 4 (MEM - Memory Access):
+  • Because `MemRead == 0` and `MemWrite == 0`: Memory Bus is IDLE
+
+Phase 5 (WB - Write-Back & Status Update):
+  • `MemToReg MUX` has select line `0`, so it routes `ALU_Out` (30) to Write Port
+  • Because `RegWrite == 1`: R0 latches `30`
+  • Because `SetCC == 1`: PSR latches `0b001` [P]
+
+End of Step 2 State:
+  Latches       : PC=12290, IR=0x10A5, MAR=12289, MDR=4261, PSR=0b001 [P]
+  Register File : R0=30, R1=25, R2=0, R3=0, R4=0, R5=0, R6=0, R7=0
+
+--------------------------------------------------------------------------------
+STEP 3: `ADD R2, R1, R0` (Register-Mode Addition)
+--------------------------------------------------------------------------------
+Initial State: PC=12290, R0=30, R1=25, other registers=0
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12290)
+  • MDR <= RAM[12290] (reads `0001 010 001 000 000` / `0x1440`)
+  • IR  <= MDR (`0x1440`)
+  • PC  <= PC + 1 = 12291
+
+Phase 2 (ID - Instruction Decode & Control Assertion):
+  • Decoder extracts: Opcode=0001 (ADD), DR=R2, SR1=R1, ImmFlag=0, SR2=R0
+  • ControlUnit asserts:
+    RegWrite=1, ALUSrc=REG, MemRead=0, MemWrite=0, MemToReg=0, ALUOp=ADD, SetCC=1
+  • Register File Read Port A reads R1 -> outputs `25`
+  • Register File Read Port B reads R0 -> outputs `30`
+
+Phase 3 (EX - Execute / ALU):
+  • `ALUSrc MUX` has select line `REG`, so it routes Port B (`30`) into ALU Input B
+  • ALU Input A = `25`, ALU Input B = `30`, Operation = `ADD`
+  • ALU computes: `25 + 30 = 55`
+  • ALU condition detector: 55 > 0 -> Flags: N=0, Z=0, P=1 (PSR flag = `0b001`)
+
+Phase 4 (MEM - Memory Access):
+  • Memory Bus is IDLE (`MemRead=0, MemWrite=0`)
+
+Phase 5 (WB - Write-Back & Status Update):
+  • `MemToReg MUX` has select line `0`, so it routes `ALU_Out` (55) to Write Port
+  • Because `RegWrite == 1`: R2 latches `55`
+  • Because `SetCC == 1`: PSR latches `0b001` [P]
+
+End of Step 3 State:
+  Latches       : PC=12291, IR=0x1440, MAR=12290, MDR=5184, PSR=0b001 [P]
+  Register File : R0=30, R1=25, R2=55, R3=0, R4=0, R5=0, R6=0, R7=0
+
+
+================================================================================
+6. SUMMARY OF ARCHITECTURAL ADVANCEMENTS IN VERSION 2.2
+================================================================================
+By introducing `ControlUnit` and `ALU`:
+1. Every micro-operation is governed by explicit binary control wires.
+2. Data selection is performed by physical multiplexers (`ALUSrc` and `MemToReg`).
+3. Arithmetic and status flags are computed exclusively inside the hardware ALU.
+4. The system is 100% faithful to true digital logic architecture without any
+   ad-hoc software shortcuts.
+

@@ -1,0 +1,219 @@
+================================================================================
+                    VERSION 2.1: DEDICATED HARDWARE STORAGE & LATCHES
+================================================================================
+
+1. OVERVIEW & PURPOSE
+---------------------
+Version 2.1 transforms the educational LC-3 Virtual Machine from a high-level
+software interpreter into a hardware-accurate CPU model.
+
+In older versions (Version 2.0), the VM used arbitrary software data structures:
+all registers were stored in a single flat JavaScript 10-element array where
+R0-R7 were indexes 0-7, PC was index 8, and PSR was index 9. Memory was accessed
+instantaneously like an array lookup (`vm.mem[address]`), with no memory bus,
+no address latching, and no write-gating.
+
+Version 2.1 eliminates all legacy software shims and introduces dedicated,
+physically inspired hardware storage units:
+1. `RegisterFile` (R0 through R7): Multi-port register bank with dual read ports
+   and a write port gated by a write-enable signal (`RegWrite`).
+2. `Latches`: Dedicated internal micro-architectural CPU latches (`PC`, `IR`,
+   `MAR`, `MDR`, and `PSR`).
+3. 5-Phase Hardware Cycle: Every instruction flows sequentially through
+   Instruction Fetch (IF), Instruction Decode (ID), Execute (EX), Memory Access
+   (MEM), and Write-Back (WB).
+
+
+================================================================================
+2. HOW VERSION 2.1 DIFFERS FROM VERSION 2.0
+================================================================================
+
+Feature                    Version 2.0 (Software Model)    Version 2.1 (Hardware Model)
+-------------------------  ------------------------------  -----------------------------------------
+General-Purpose Regs       Array elements `reg[0..7]`      Dedicated `RegisterFile` (R0-R7)
+Register Reading           Direct array access             Dual Read Ports (Port A & Port B)
+Register Writing           Direct assignment `reg[i] = v`  Write Port gated by `writeEnable` signal
+Program Counter (PC)       Array element `reg[8]`          Dedicated 16-bit Hardware Latch (`PC`)
+Instruction Register (IR)  Non-existent (temp variable)    Dedicated 16-bit Hardware Latch (`IR`)
+Memory Address Reg (MAR)   Non-existent                    Dedicated 16-bit Hardware Latch (`MAR`)
+Memory Data Reg (MDR)      Non-existent                    Dedicated 16-bit Hardware Latch (`MDR`)
+Status Register (PSR)      Array element `reg[9]`          Dedicated 3-bit Condition Latch (`PSR`)
+Memory Access Mechanism    Direct array lookup `mem[a]`    Bus protocol via `MAR` and `MDR`
+Execution Workflow         Single monolithic JS function   Structured 5-Phase Hardware Cycle
+
+
+================================================================================
+3. HARDWARE STORAGE UNITS IN DETAIL
+================================================================================
+
+A. THE MULTI-PORT REGISTER FILE (`storage/register-file.js`)
+------------------------------------------------------------
+In real silicon, a register bank cannot be accessed like a random software array.
+The Version 2.1 Register File encapsulates 8 general-purpose 16-bit registers (R0-R7)
+behind explicit physical hardware ports:
+
+1. Read Port A:
+   - Combinational read port used for Source Register 1 (SR1).
+   - Calling `regFile.readPortA(regIndex)` reads the value without modifying state.
+2. Read Port B:
+   - Independent combinational read port used for Source Register 2 (SR2).
+   - Calling `regFile.readPortB(regIndex)` allows the CPU to read two operands
+     simultaneously in the Decode (ID) stage.
+3. Write Port with Write-Enable (`writeEnable` / `RegWrite`):
+   - In hardware, writing to a register requires asserting the write-enable wire
+     HIGH on the clock edge.
+   - Calling `regFile.write(regIndex, value, writeEnable)` only latches the data
+     if `writeEnable === true`. If `writeEnable === false`, the write is ignored.
+   - Enforces 16-bit bounds (`0x0000` to `0xFFFF`) and valid register indexes (0-7).
+
+B. SPECIAL HARDWARE LATCHES (`storage/latches.js`)
+-------------------------------------------------
+Real processors have internal registers that hold state between pipeline stages:
+
+1. `PC` (Program Counter):
+   - 16-bit latch holding the memory address of the next instruction to fetch.
+   - Initialized to `DEFAULT_CODE_START` (`0x3000` / `12288` decimal).
+2. `IR` (Instruction Register):
+   - 16-bit latch that preserves the fetched machine instruction word so it
+     remains stable during decoding and execution.
+3. `MAR` (Memory Address Register):
+   - 16-bit latch connected to the external Memory Address Bus.
+   - All reads and writes to RAM must first place the target address into MAR.
+4. `MDR` (Memory Data Register):
+   - 16-bit latch connected to the bidirectional Memory Data Bus.
+   - During a memory read, data from RAM is latched into MDR.
+   - During a memory write, data in MDR is driven onto the bus into RAM.
+5. `PSR` (Processor Status Register):
+   - Holds the 3 condition code bits:
+     • Negative (N - Bit 2, value `0b100`)
+     • Zero     (Z - Bit 1, value `0b010`)
+     • Positive (P - Bit 0, value `0b001`)
+
+
+================================================================================
+4. THE 5-PHASE HARDWARE CYCLE
+================================================================================
+
+Every instruction in Version 2.1 executes through 5 standardized phases:
+
+[Phase 1: IF - Instruction Fetch]
+  1. The CPU copies the Program Counter into the Memory Address Register: `MAR <= PC`.
+  2. The memory bus reads the 16-bit instruction word from RAM at `MAR` into `MDR`.
+  3. The instruction word is transferred from `MDR` into the Instruction Register: `IR <= MDR`.
+  4. The Program Counter is incremented by 1: `PC <= PC + 1`.
+
+[Phase 2: ID - Instruction Decode & Register Read]
+  1. The 16-bit word in `IR` is unpacked into fields: Opcode, DR, SR1, ImmFlag, SR2/Imm5/Offset9.
+  2. The Register File reads operands:
+     - Read Port A outputs the value of `R[SR1]`.
+     - Read Port B outputs the value of `R[SR2]` (if register mode).
+  3. Sign-extension units extend 5-bit immediates or 9-bit offsets to 16 bits.
+
+[Phase 3: EX - Execute / ALU / Address Calculation]
+  - For ADD: Arithmetic addition is computed (`SR1 + SR2` or `SR1 + Imm5`).
+  - For LD : Address adder computes the Effective Address: `PC + SEXT(PCoffset9)`.
+
+[Phase 4: MEM - Memory Access]
+  - For ADD: Memory stage is IDLE (no memory read or write needed).
+  - For LD : The Effective Address is placed into `MAR`: `MAR <= Effective Address`.
+             Data at that address is read into `MDR`: `MDR <= RAM[MAR]`.
+
+[Phase 5: WB - Write-Back & Status Update]
+  1. The result (ALU output for ADD, or MDR contents for LD) is placed onto the
+     Register File write port.
+  2. `writeEnable` is held HIGH, latching the result into `R[DR]`.
+  3. The Processor Status Register evaluates the result and latches N, Z, or P into `PSR`.
+
+
+================================================================================
+5. COMPLETE STEP-BY-STEP WALKTHROUGH WITH AN EXAMPLE
+================================================================================
+
+Consider the following two-instruction program loaded at address `0x3000` (`12288`):
+
+  Line 1: LD R1, #25       ; Loads literal value 25 into R1
+  Line 2: ADD R0, R1, R1   ; Computes R0 = R1 + R1 (25 + 25 = 50)
+
+Memory Layout created by the Assembler:
+  Address 12288 (0x3000) : Instruction 1 -> `0010 001 000000001` (LD R1, Offset +1)
+  Address 12289 (0x3001) : Instruction 2 -> `0001 000 001 000 001` (ADD R0, R1, R1)
+  Address 12290 (0x3002) : Literal Pool  -> Value 25
+
+--------------------------------------------------------------------------------
+STEP 1: Executing `LD R1, #25`
+--------------------------------------------------------------------------------
+Initial State before Step 1:
+  PC = 12288, IR = 0, MAR = 0, MDR = 0, PSR = 0b010 (ZERO)
+  Register File: all R0-R7 = 0
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12288)
+  • MDR <= RAM[12288] (reads `0010 001 000000001` / `0x2201`)
+  • IR  <= MDR (`0x2201` is now latched in IR)
+  • PC  <= PC + 1 = 12289
+
+Phase 2 (ID - Instruction Decode):
+  • Opcode  = 0b0010 (LD)
+  • DR      = R1 (Destination Register)
+  • Offset9 = +1 (sign-extended to 16-bit integer: +1)
+
+Phase 3 (EX - Execute / Address Calculation):
+  • Address Adder calculates: Effective Address = PC (12289) + Offset (+1) = 12290.
+
+Phase 4 (MEM - Memory Access):
+  • MAR <= 12290 (Effective address driven onto Address Bus)
+  • MDR <= RAM[12290] (reads the literal data `25` into MDR)
+
+Phase 5 (WB - Write-Back):
+  • Register File Write Port takes `MDR` (25) for destination `R1`.
+  • `writeEnable = true` -> R1 latches value `25`.
+  • PSR evaluates 25 (positive) -> PSR latches `0b001` (POSITIVE [P]).
+
+End of Step 1 State:
+  Latches       : PC=12289, IR=0x2201, MAR=12290, MDR=25, PSR=0b001 [P]
+  Register File : R0=0, R1=25, R2=0, R3=0, R4=0, R5=0, R6=0, R7=0
+
+--------------------------------------------------------------------------------
+STEP 2: Executing `ADD R0, R1, R1`
+--------------------------------------------------------------------------------
+Initial State before Step 2:
+  PC = 12289, R1 = 25, all other registers = 0
+
+Phase 1 (IF - Instruction Fetch):
+  • MAR <= PC (12289)
+  • MDR <= RAM[12289] (reads `0001 000 001 000 001` / `0x1041`)
+  • IR  <= MDR (`0x1041` latched in IR)
+  • PC  <= PC + 1 = 12290
+
+Phase 2 (ID - Instruction Decode & Register Read):
+  • Opcode  = 0b0001 (ADD)
+  • DR      = R0 (Destination Register)
+  • SR1     = R1, SR2 = R1
+  • ImmFlag = 0 (Register mode)
+  • Register File Read Port A reads R1 -> outputs `25`
+  • Register File Read Port B reads R1 -> outputs `25`
+
+Phase 3 (EX - Execute):
+  • 16-bit addition: `25 + 25 = 50`.
+
+Phase 4 (MEM - Memory Access):
+  • Memory stage is IDLE (ADD does not interact with RAM).
+  • MAR and MDR remain unchanged from previous state.
+
+Phase 5 (WB - Write-Back):
+  • Register File Write Port takes `50` for destination `R0`.
+  • `writeEnable = true` -> R0 latches value `50`.
+  • PSR evaluates 50 (positive) -> PSR latches `0b001` (POSITIVE [P]).
+
+End of Step 2 State:
+  Latches       : PC=12290, IR=0x1041, MAR=12290, MDR=25, PSR=0b001 [P]
+  Register File : R0=50, R1=25, R2=0, R3=0, R4=0, R5=0, R6=0, R7=0
+
+
+================================================================================
+6. SUMMARY
+================================================================================
+Version 2.1 successfully removes all legacy shortcuts. Every register access,
+memory access, address generation, and condition code latching operates through
+authentic, physically modeled components (`RegisterFile` and `Latches`) following
+the exact 5-phase execution flow of a real computer processor.
