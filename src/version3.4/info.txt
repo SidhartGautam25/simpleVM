@@ -1,0 +1,146 @@
+================================================================================
+   VERSION 3.4: UNIFIED 3-PART SYSTEM BUS & 3-BIT GATE DECODER ARCHITECTURE
+================================================================================
+
+1. OVERVIEW & PURPOSE
+---------------------
+Version 3.4 replaces abstract software boolean flags with authentic physical
+computer bus architectures:
+  1. The **Unified 3-Part System Bus** (`memory/system-bus.js`):
+     - **Address Bus** (16-bit parallel copper traces $A_{15} \dots A_0$) driven by MAR.
+     - **Data Bus** (16-bit bidirectional traces $D_{15} \dots D_0$) driven by RAM/MDR.
+     - **Control Bus** (Individual 1-bit physical voltage lines: `MEM_READ`, `MEM_WRITE`, `MEM_READY`).
+  2. The **3-bit Gate Selector Code & 3-to-8 Line Decoder** (`cpu/internal-bus.js`):
+     - Eliminates independent software booleans (`GatePC: true`, `GateALU: true`).
+     - Real hardware enforces the rule that only ONE component may drive the bus
+       at any given instant to prevent electrical short-circuits.
+     - The Control Unit outputs a 3-bit binary gate code (`BUS_GATE`):
+         • `0b000` (0): NONE (Bus is floating in High-Impedance / Hi-Z)
+         • `0b001` (1): GatePC (PC drives internal bus)
+         • `0b010` (2): GateMDR (MDR drives internal bus)
+         • `0b011` (3): GateALU (ALU output drives internal bus)
+         • `0b100` (4): GateMARMUX (Address Adder drives internal bus)
+     - A simulated 3-to-8 hardware line decoder decodes this 3-bit code into
+       exactly one active-high enable line.
+  3. **Strict 1-Bit Binary Signal Representation**:
+     - All control wire signals, load enables (`LD_MAR`, `LD_MDR`, `LD_IR`, `LD_PC`, `LD_REG`, `LD_CC`),
+       and memory strobes are represented as strict binary bits (`SIGNAL_LOW = 0`, `SIGNAL_HIGH = 1`).
+  4. **Packed 32-bit Micro-Instruction Words**:
+     - `MicroSequencer.packMicroWord()` demonstrates how all 32 control bits are
+       packed into a single physical ROM word.
+
+
+================================================================================
+2. HOW VERSION 3.4 DIFFERS FROM VERSION 3.3
+================================================================================
+
+Feature                    Version 3.3                      Version 3.4
+-------------------------  -------------------------------  ---------------------------------------------
+System Bus Architecture    Single generic memory interface  **Unified 3-Part System Bus (Address, Data, Control)**
+Control Bus Width          Implicit booleans                **Bundle of individual 1-bit wires (MEM_READ, MEM_WRITE, MEM_READY)**
+Central Bus Drivers        Loose booleans (`GatePC: true`)  **3-bit Binary Gate Selector Code (`0b001`, `0b010`...)**
+Gate Selection Hardware    None (Direct property check)     **Simulated 3-to-8 Line Binary Decoder Circuit**
+Control Signal Format      Booleans (`true` / `false`)      **Strict Binary Numbers (0 = 0V, 1 = 3.3V)**
+Load Enable Gating         `LD_MAR: true`                   **Physical 1-bit wire (`LD_MAR: 1`)**
+Micro-Word Storage         JavaScript objects               **Formal 32-bit packed binary ROM micro-words**
+Telemetry & Tracing        Generic memory bus trace         **Explicit 3-Bus status + 3-bit Gate Code decoding**
+
+
+================================================================================
+3. SYSTEM BUS HIERARCHY IN DETAIL
+================================================================================
+
+--------------------------------------------------------------------------------
+A. The External Motherboard System Bus (`memory/system-bus.js`)
+--------------------------------------------------------------------------------
+Links the CPU core (MAR, MDR) to the Bus Address Decoder, Dynamic RAM, and MMIO:
+1. `AddressBus` (16-bit):
+   - Driven exclusively by MAR.
+   - Carries binary address words (e.g. `0x3000` or `0xFE00`).
+2. `DataBus` (16-bit):
+   - Bidirectional wires.
+   - Floats in High-Impedance (`Hi-Z`) when idle.
+   - Driven by RAM/MMIO during reads, or by MDR during writes.
+3. `ControlBus` (Collection of 1-bit wires):
+   - `MEM_READ`  (1-bit): CPU strobes 1 to initiate read.
+   - `MEM_WRITE` (1-bit): CPU strobes 1 to initiate write.
+   - `MEM_READY` (1-bit): Memory chip strobes 1 when access finishes.
+
+--------------------------------------------------------------------------------
+B. The Central Internal CPU Datapath Bus (`cpu/internal-bus.js`)
+--------------------------------------------------------------------------------
+Transmits data between registers inside the CPU core:
+• Controlled by 3-bit Gate Code:
+    `BUS_GATE.NONE   = 0b000 (0)`
+    `BUS_GATE.PC     = 0b001 (1)`
+    `BUS_GATE.MDR    = 0b010 (2)`
+    `BUS_GATE.ALU    = 0b011 (3)`
+    `BUS_GATE.MARMUX = 0b100 (4)`
+• Decoded by `InternalBus.decode3to8(gateCode)`:
+    Activates exactly one tri-state buffer line while ensuring the other 7 lines remain 0.
+
+
+================================================================================
+4. IMPLEMENTATION DETAILS IN CODEBASE
+================================================================================
+
+1. `constants.js`:
+   - Added `SIGNAL_LOW = 0`, `SIGNAL_HIGH = 1`.
+   - Added `BUS_GATE` (3-bit binary gate codes) and `BUS_GATE_NAMES`.
+   - Added `CONTROL_LINE` (`MEM_READ`, `MEM_WRITE`, `MEM_READY`).
+
+2. `memory/system-bus.js`:
+   - Implements `AddressBus`, `DataBus`, `ControlBus`, and `SystemBus`.
+   - `readCycle(latches)` and `writeCycle(latches)` execute coordinated transactions
+     across all three buses, properly setting `MEM_READ`/`MEM_WRITE`, driving address lines,
+     floating data lines, and asserting `MEM_READY`.
+
+3. `memory/bus-interface.js`:
+   - Wraps `SystemBus` and `AddressDecoder`.
+   - Exposes `bus.addressBus`, `bus.dataBus`, and `bus.controlBus`.
+
+4. `cpu/internal-bus.js`:
+   - Implements 3-to-8 decoder (`decode3to8`) and `driveWithGate(gateCode, value)`.
+   - Enforces 3-bit gate code constraints (0..7).
+
+5. `cpu/micro-sequencer.js`:
+   - Replaced all booleans in `CONTROL_STORE_ROM` with binary numbers (`0` and `1`)
+     and 3-bit `gateCode`s.
+   - Added `MicroSequencer.packMicroWord()` to pack 32 bits into a physical ROM word.
+
+6. `cpu/cpu-pipeline.js` & `cpu/instruction-describer.js`:
+   - Updated micro-cycle execution to use 3-bit gate codes and display real-time
+     System Bus lines and internal gate decoding.
+
+
+================================================================================
+5. WORKFLOW WALKTHROUGH
+================================================================================
+
+When executing `node src/version3.4/example.js`:
+1. **Instruction Fetch (Clock 1 & 2)**:
+   - Clock 1 (uPC 18):
+     • Central Bus: GateCode `0b001` (GatePC=1) -> PC (0x3000) drives Central Bus -> LD_MAR=1.
+     • System Address Bus: Driven with `0x3000`. Address Decoder asserts `RAM_CS=1`.
+     • System Control Bus: Strobes `MEM_READ=1`.
+   - Clock 2 (uPC 33):
+     • RAM places instruction onto System Data Bus (`0x2204`).
+     • Control Bus asserts `MEM_READY=1`.
+     • Central Bus asserts LD_MDR=1 -> MDR latches `0x2204`.
+2. **Instruction Decode & Increment (Clock 3 & 4)**:
+   - Clock 3 (uPC 35):
+     • Central Bus: GateCode `0b010` (GateMDR=1) -> MDR drives Central Bus.
+     • Central Bus asserts LD_IR=1 (IR latches `0x2204`), LD_PC=1 (PC increments).
+   - Clock 4 (uPC 32):
+     • Microsequencer evaluates `COND=BRANCH_OPCODE` -> Branches to State 2 (`LD`).
+3. **Execution & Write-Back (Clock 5 & 6)**:
+   - Clock 5 (uPC 2):
+     • Central Bus: GateCode `0b100` (GateMARMUX=1) -> Effective address `0x3005` drives bus.
+     • System Address Bus: Lines driven with `0x3005`. Address Decoder asserts `RAM_CS=1`.
+     • System Control Bus: Strobes `MEM_READ=1`.
+   - Clock 6 (uPC 25):
+     • System Data Bus receives `25` from RAM. Control Bus confirms `MEM_READY=1`.
+     • Central Bus: GateCode `0b010` (GateMDR=1) -> MDR drives Central Bus.
+     • Central Bus asserts LD_REG=1 (R1 <= 25), LD_CC=1 (PSR updated).
+     • Instruction finishes and loops back to State 18!
+================================================================================

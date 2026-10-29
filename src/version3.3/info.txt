@@ -1,0 +1,156 @@
+================================================================================
+     VERSION 3.3: MEMORY-MAPPED I/O & BUS ADDRESS DECODER (memory/address-decoder.js)
+================================================================================
+
+1. OVERVIEW & PURPOSE
+---------------------
+Version 3.3 introduces authentic computer hardware input/output:
+`memory/address-decoder.js` (Memory-Mapped I/O & Bus Address Decoder).
+
+In Version 3.2 and earlier:
+  • All 65,536 addresses mapped uniformly to a single JavaScript TypedArray (`ram`).
+  • I/O and text printing were simulated via JavaScript `console.log()` calls.
+  • The CPU had no mechanism to interact with external hardware peripherals.
+
+How Real Hardware Operates:
+  • Physical microprocessors have NO high-level "console print" or "read keyboard"
+    instructions.
+  • All communication with keyboards, monitors, serial interfaces, and disk controllers
+    is mediated over the **Memory Address Bus** and **Data Bus** using **Memory-Mapped I/O (MMIO)**.
+  • The Memory Address Bus (driven by MAR) is continuously monitored by an **Address Decoder**
+    logic circuit.
+  • Based on the binary address placed on the bus:
+      - Addresses 0x0000 - 0xFDFF (0 to 65023):
+          The decoder asserts `RAM_CS` (RAM Chip Select).
+          The cycle is routed to physical dynamic RAM chips.
+      - Addresses 0xFE00 - 0xFFFF (65024 to 65535):
+          The decoder asserts `IO_CS` (Device Chip Select).
+          The cycle is routed to dedicated **Hardware Device Registers**:
+            • 0xFE00: Keyboard Status Register (KBSR)
+            • 0xFE02: Keyboard Data Register   (KBDR)
+            • 0xFE04: Display Status Register  (DSR)
+            • 0xFE06: Display Data Register    (DDR)
+
+
+================================================================================
+2. HOW VERSION 3.3 DIFFERS FROM VERSION 3.2
+================================================================================
+
+Feature                    Version 3.2                      Version 3.3
+-------------------------  -------------------------------  ---------------------------------------------
+Memory Address Routing     Flat 64KB RAM (All addresses)    **Partitioned via Address Decoder (`AddressDecoder`)**
+Address Bus Monitoring     None                             **Real-time decode of MAR for RAM_CS vs IO_CS**
+RAM Address Range          0x0000 - 0xFFFF (All)            **0x0000 - 0xFDFF (Physical Dynamic RAM)**
+MMIO Device Register Range None (Unmapped)                  **0xFE00 - 0xFFFF (Dedicated Hardware Peripherals)**
+Keyboard Hardware Input    None                             **KBSR (0xFE00) & KBDR (0xFE02) with auto-clear**
+Screen Display Output      Ad-hoc JS `console.log` strings  **DSR (0xFE04) & DDR (0xFE06) Hardware MMIO**
+Peripheral Side Effects    None                             **Reading KBDR clears ready bit; writing DDR transmits**
+Telemetry & Trace          Microcode FSM path only          **FSM path + Address Bus Decoding & Chip Selects**
+
+
+================================================================================
+3. HARDWARE DEVICE REGISTERS IN DETAIL
+================================================================================
+
+The LC-3 computer architecture standard defines four fundamental device registers:
+
+1. Keyboard Status Register (KBSR - Address: 0xFE00 / 65024):
+   • Bit [15] (Ready Bit - 0x8000):
+       - Set to 1 by keyboard hardware when the user presses a key.
+       - Set to 0 when no new key is available.
+   • Bits [14:0]: Reserved / 0.
+   • The CPU polls this register to determine if a character is waiting.
+
+2. Keyboard Data Register (KBDR - Address: 0xFE02 / 65026):
+   • Bits [7:0]: ASCII character code of the pressed key.
+   • Bits [15:8]: 0.
+   • HARDWARE SIDE EFFECT: When the CPU reads KBDR via a bus read cycle,
+     the Address Decoder automatically clears Bit [15] of KBSR back to 0!
+     This informs the keyboard hardware that the current keystroke has been
+     consumed, preventing duplicate reads.
+
+3. Display Status Register (DSR - Address: 0xFE04 / 65028):
+   • Bit [15] (Ready Bit - 0x8000):
+       - Set to 1 when the display device is ready to accept a new character.
+       - Set to 0 when the display device is busy rendering.
+   • In our virtual machine, DSR is ready by default (0x8000).
+
+4. Display Data Register (DDR - Address: 0xFE06 / 65030):
+   • Bits [7:0]: ASCII character code to be transmitted to the screen.
+   • HARDWARE SIDE EFFECT: When the CPU writes to DDR via a bus write cycle
+     (`MemWrite = 1`), the Address Decoder intercepts the byte and transmits it
+     directly to the physical screen/display buffer (`vm.getDisplayOutput()`)!
+
+
+================================================================================
+4. IMPLEMENTATION DETAILS IN CODEBASE
+================================================================================
+
+1. `memory/address-decoder.js`:
+   • Implements `AddressDecoder` class.
+   • `decode(address)`: Evaluates 16-bit address and outputs:
+     `{ target: 'RAM' | 'DEVICE', ramChipSelect, deviceChipSelect, deviceName, address }`.
+   • `read(address, latches)`:
+     - If RAM: reads `this.ram[address]`, latches into `latches.MDR`.
+     - If MMIO: returns `kbsr`, `kbdr`, `dsr`, or `ddr`, latches into `latches.MDR`.
+     - Triggers automatic clearing of `kbsr` ready bit when reading `kbdr`.
+   • `write(address, data, latches)`:
+     - If RAM: writes into `this.ram[address]`.
+     - If MMIO: writes to device register. If address is `DDR` (0xFE06), appends
+       ASCII character to `this.displayBuffer`.
+   • `typeChar(char)` / `queueInput(text)`: Peripheral simulation helpers that
+     assert the ready bit and queue keystrokes.
+
+2. `memory/bus-interface.js`:
+   • Instantiates and holds `AddressDecoder`.
+   • `readCycle(latches, memRead)`: Routes memory read requests through `addressDecoder.read()`.
+   • `writeCycle(latches, memWrite)`: Routes memory write requests through `addressDecoder.write()`.
+   • Populates `lastTransaction` with chip-select line states (`ramChipSelect`, `deviceChipSelect`).
+
+3. `cpu/cpu-pipeline.js`:
+   • Enhances State 18 (Fetch 1), State 33 (Fetch 2), State 2 (LD Address Calc),
+     and State 25 (LD Memory Read) to log Address Decoder routing and chip select
+     assertions in real time.
+
+4. `vm.js`:
+   • Exposes high-level MMIO getters and helpers:
+     - `vm.typeChar(char)`: Types a key into the keyboard.
+     - `vm.getDisplayOutput()`: Reads all text rendered on the display screen.
+     - `vm.readMemory(address)` / `vm.writeMemory(address, value)`: Conducts hardware
+       bus cycles via MAR and MDR mediated by the Address Decoder.
+     - `vm.mmioState`: Complete snapshot of all device registers.
+
+
+================================================================================
+5. COMPLETE WORKFLOW & EXAMPLE WALKTHROUGH
+================================================================================
+
+Below is what occurs when executing `node src/version3.3/example.js`:
+
+Part 1: Instruction Execution in RAM
+• PC = 0x3000 (12288)
+• MAR <= 0x3000
+• Address Decoder examines MAR: Range [0x0000 - 0xFDFF] -> Asserts `RAM_CS`.
+• Memory read fetches instruction from physical RAM.
+
+Part 2: Keyboard Input via MMIO Polling
+• Initial state: KBSR (0xFE00) = 0x0000 (Ready bit = 0).
+• User presses key 'K':
+  - Keyboard hardware sets KBDR = 0x004B (ASCII 75, 'K').
+  - Keyboard hardware sets KBSR = 0x8000 (Bit 15 = 1, Ready!).
+• CPU checks KBSR (MAR = 0xFE00):
+  - Address Decoder examines MAR: Range [0xFE00 - 0xFFFF] -> Asserts `IO_CS` for KBSR.
+  - MDR receives 0x8000. CPU detects ready bit!
+• CPU reads KBDR (MAR = 0xFE02):
+  - Address Decoder asserts `IO_CS` for KBDR.
+  - MDR receives 0x004B ('K').
+  - Address Decoder automatically clears KBSR ready bit back to 0x0000!
+
+Part 3: Display Screen Output via MMIO Writing
+• CPU checks DSR (MAR = 0xFE04):
+  - Address Decoder asserts `IO_CS` for DSR -> MDR receives 0x8000 (Display Ready).
+• CPU writes 'H', 'E', 'L', 'L', 'O' to DDR (MAR = 0xFE06, MDR = ASCII):
+  - Address Decoder asserts `IO_CS` for DDR.
+  - Each write immediately transmits the character to the screen buffer.
+• Final display output: `"HELLO, WORLD!"` rendered with zero software console.log hacks!
+================================================================================

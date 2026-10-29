@@ -1,0 +1,385 @@
+================================================================================
+         COMPUTER ARCHITECTURE THEORY & CONCEPTS: VERSION 3.4
+  THE UNIFIED 3-PART SYSTEM BUS, 3-BIT GATE DECODER, AND BINARY CONTROL LINES
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Introduction & Overview: What Are These Topics?
+2. The Motivating Problem: Why Do Distinct Bus Types and Gate Decoders Exist?
+   A. The Electrical Disaster of Bus Contention (Competing Voltage Drivers)
+   B. Why the Control Bus is NOT a 16-bit Number
+   C. Internal Datapath Wires vs. External Motherboard System Bus
+   D. The Silicon Area Problem: Horizontal vs. Vertical Microcode Gating
+3. In-Depth Physical & Electrical Theory
+   A. The Physics of the 3-Part System Bus (Address, Data, and Control)
+      • 16-bit Address Bus ($A_{15} \dots A_0$)
+      • 16-bit Bidirectional Data Bus ($D_{15} \dots D_0$)
+      • 1-bit Physical Control Lines (`MEM_READ`, `MEM_WRITE`, `MEM_READY`)
+   B. Voltage Signals in Silicon: 0 Volts (LOW) vs. 3.3 Volts (HIGH)
+   C. Tri-State Buffers and High-Impedance State (Hi-Z)
+   D. The 3-to-8 Line Binary Gate Decoder Circuit
+   E. Gate Gating (Mutually Exclusive) vs. Load Enables (Simultaneous Latching)
+   F. Anatomy of a Packed 32-Bit Micro-Instruction ROM Word
+4. How Real Silicon Hardware Works (With Structural Schematics & Truth Tables)
+   A. System Bus Architecture Schematic (CPU, MAR, MDR, System Bus, RAM, MMIO)
+   B. Central Internal Bus & 3-to-8 Line Gate Decoder Schematic
+   C. 3-to-8 Gate Decoder Truth Table
+   D. Complete Micro-Instruction ROM Control Bit Matrix
+   E. Micro-Cycle Handshaking Sequence across the 3 System Buses
+5. How These Concepts Assist Program Execution & System Reliability
+6. Implementation in Version 3.4 Codebase
+   A. `memory/system-bus.js` (`AddressBus`, `DataBus`, `ControlBus`, `SystemBus`)
+   B. `cpu/internal-bus.js` (3-to-8 Decoder & `BUS_GATE` Codes)
+   C. `cpu/micro-sequencer.js` (Numeric Bit Fields & `packMicroWord`)
+   D. `cpu/control-unit.js` & `cpu/cpu-pipeline.js` (Binary Signals & Telemetry)
+
+
+================================================================================
+1. INTRODUCTION & OVERVIEW: WHAT ARE THESE TOPICS?
+================================================================================
+
+In software programming, variables can be passed freely between functions, and
+data moves abstractly through memory. However, inside a physical silicon microprocessor
+and motherboard, data cannot magically jump through space. Every bit of information
+must physically travel across microscopic copper traces called **BUSES**.
+
+In Version 3.4, we replace abstract software boolean flags (`GatePC: true`,
+`LD_MAR: true`, `MemRead: true`) with the authentic, physical electrical
+architecture of digital computers:
+
+1. The Unified 3-Part System Bus:
+   The external electronic highway connecting the CPU core to physical RAM and
+   Memory-Mapped I/O (MMIO) hardware peripherals:
+   • Address Bus (16 parallel copper wires carrying address voltages).
+   • Data Bus (16 parallel bidirectional wires carrying data words).
+   • Control Bus (A bundle of individual 1-bit wires: `MEM_READ`, `MEM_WRITE`, `MEM_READY`).
+
+2. 3-Bit Binary Gate Selector Codes & 3-to-8 Line Decoder:
+   Because only ONE component may drive the central datapath bus at any given
+   moment, real CPUs do not run independent wires across the chip for every gate.
+   Instead, the Control Unit outputs a 3-bit binary gate code (`001` for PC,
+   `010` for MDR, `011` for ALU, `100` for MARMUX), and a hardware 3-to-8 Line
+   Decoder activates the chosen tri-state buffer.
+
+3. Strict 1-Bit Binary Signals:
+   All control signals, memory strobes, and register load enables are modeled as
+   physical binary bit levels: `SIGNAL_LOW = 0` (0 Volts) and `SIGNAL_HIGH = 1` (3.3 Volts).
+
+4. Packed 32-Bit Micro-Instruction ROM Words:
+   Demonstrates how microcode control bits are physically packed into binary bit-vectors
+   in on-chip Read-Only Memory.
+
+
+================================================================================
+2. THE MOTIVATING PROBLEM: WHY DO DISTINCT BUSES & DECODERS EXIST?
+================================================================================
+
+--------------------------------------------------------------------------------
+A. The Electrical Disaster of Bus Contention (Competing Voltage Drivers)
+--------------------------------------------------------------------------------
+Consider a shared copper wire connected to two digital chips:
+• Chip A tries to output a binary `1` (+3.3 Volts).
+• Chip B simultaneously tries to output a binary `0` (0 Volts / Ground).
+
+What happens?
+You have connected a 3.3V power rail directly to Ground through two low-resistance
+transistors. The resulting massive surge of electric current creates **Bus Contention**:
+  1. The voltage on the wire floats to an undefined invalid state (around 1.5V),
+     corrupting all data in the system.
+  2. The excessive current produces severe heat dissipation, permanently destroying
+     the output transistors of both chips!
+
+To prevent this catastrophe, physical buses enforce a strict hardware law:
+> **At any given instant in time, EXACTLY ONE device is permitted to drive the bus.**
+
+--------------------------------------------------------------------------------
+B. Why the Control Bus is NOT a 16-Bit Number
+--------------------------------------------------------------------------------
+A common misconception is thinking that because the Address Bus and Data Bus are
+16 bits wide, the Control Bus must also be a 16-bit number.
+
+In real computer engineering:
+• The Address Bus needs 16 bits because it must encode $2^{16} = 65,536$ unique
+  numerical addresses.
+• The Data Bus needs 16 bits because each memory word is 16 bits wide.
+• The Control Bus, however, is **NOT a number**!
+  It is a collection of **individual 1-bit control wires**:
+    - `MEM_READ` is physically a single wire running from the CPU to the RAM's Output Enable pin.
+    - `MEM_WRITE` is physically a single wire running to the RAM's Write Enable pin.
+    - `MEM_READY` is physically a single wire running from the RAM back to the CPU.
+
+If `MEM_READ` were part of a 16-bit number, the RAM chip would need a full arithmetic
+processor just to decode whether to read or write! By keeping control lines as
+independent 1-bit wires, memory chips can respond at the speed of light simply by
+checking if a single wire is HIGH (3.3V) or LOW (0V).
+
+--------------------------------------------------------------------------------
+C. Internal Datapath Wires vs. External Motherboard System Bus
+--------------------------------------------------------------------------------
+There is a fundamental physical distinction between:
+1. The External System Bus:
+   Long copper traces (centimeters long) on the motherboard connecting the CPU socket
+   to RAM sticks, PCIe slots, and peripheral chips.
+2. The Internal CPU Datapath Bus:
+   Microscopic aluminum or copper traces (micrometers long) etched directly onto the
+   silicon die inside the processor chip.
+
+Signals like `GatePC`, `GateALU`, `LD.MAR`, and `LD.IR` never leave the CPU chip!
+They are internal control wires that route data between internal registers and the ALU.
+Only `MAR` (Address Bus), `MDR` (Data Bus), and the Memory Strobes (`MEM_READ`, `MEM_WRITE`)
+connect to the external system bus.
+
+--------------------------------------------------------------------------------
+D. The Silicon Area Problem: Horizontal vs. Vertical Microcode Gating
+--------------------------------------------------------------------------------
+On a silicon die, routing wires takes up immense physical space.
+If a processor had 16 different components that could drive the internal bus:
+• Option A (Horizontal Control): Run 16 separate physical wires across the chip
+  from the Control Unit to every driver. This wastes vast silicon area on routing channels.
+• Option B (Vertical Microcode): Run only 4 wires representing a 4-bit binary code
+  ($2^4 = 16$). Place a tiny 4-to-16 Line Decoder next to the bus.
+
+Version 3.4 implements Option B: The Control Unit emits a 3-bit `BUS_GATE` selector
+code, which is decoded by a hardware 3-to-8 Line Decoder.
+
+
+================================================================================
+3. IN-DEPTH PHYSICAL & ELECTRICAL THEORY
+================================================================================
+
+--------------------------------------------------------------------------------
+A. The Physics of the 3-Part System Bus
+--------------------------------------------------------------------------------
+The motherboard system bus consists of 3 distinct, synchronized groups:
+
+1. 16-bit Address Bus ($A_{15} \dots A_0$):
+   • Driven by: Memory Address Register (MAR) tri-state drivers.
+   • Monitored by: Address Decoder and RAM chip address pins.
+   • Function: Specifies the exact target memory location (0x0000 to 0xFFFF).
+
+2. 16-bit Data Bus ($D_{15} \dots D_0$):
+   • Bidirectional: Data flows from RAM -> MDR during reads, or MDR -> RAM during writes.
+   • High-Impedance (Hi-Z): When no read or write cycle is active, all devices
+     disconnect from the data bus, allowing it to float harmlessly.
+
+3. System Control Bus:
+   • `MEM_READ` (1-bit): CPU drives 3.3V (HIGH) to initiate a read cycle.
+   • `MEM_WRITE` (1-bit): CPU drives 3.3V (HIGH) to initiate a write cycle.
+   • `MEM_READY` (1-bit): RAM drives 3.3V (HIGH) when data is ready on the Data Bus.
+
+--------------------------------------------------------------------------------
+B. Voltage Signals in Silicon: 0 Volts (LOW) vs. 3.3 Volts (HIGH)
+--------------------------------------------------------------------------------
+Inside a physical integrated circuit:
+• `SIGNAL_LOW (0)`: Ground (0.0 Volts $\pm$ 0.4V). NMOS pull-down transistor active.
+• `SIGNAL_HIGH (1)`: Positive supply voltage ($V_{DD} = 3.3\text{V} \pm 0.3\text{V}$). PMOS pull-up transistor active.
+
+--------------------------------------------------------------------------------
+C. Tri-State Buffers and High-Impedance State (Hi-Z)
+--------------------------------------------------------------------------------
+Standard digital logic gates only have two states: 0 and 1.
+A TRI-STATE BUFFER has a third state: HIGH-IMPEDANCE (Hi-Z):
+
+          Input A ---------[ > ]--------- Output Y
+                             ^
+                             | Enable (E)
+
+• If $E = 1$ (Active): The buffer acts like a closed switch. $Y = A$ (Drives 0V or 3.3V).
+• If $E = 0$ (Disabled): The buffer acts like an open switch (infinite electrical resistance).
+  The output is completely disconnected from the wire, allowing another chip to drive the bus.
+
+--------------------------------------------------------------------------------
+D. The 3-to-8 Line Binary Gate Decoder Circuit
+--------------------------------------------------------------------------------
+A 3-to-8 Decoder is a combinational circuit with 3 binary inputs ($S_2, S_1, S_0$)
+and 8 outputs ($Y_0 \dots Y_7$). Each output is a 3-input AND gate:
+
+  $Y_0 = \overline{S_2} \cdot \overline{S_1} \cdot \overline{S_0}$  (Code 000: NONE)
+  $Y_1 = \overline{S_2} \cdot \overline{S_1} \cdot S_0$              (Code 001: GatePC)
+  $Y_2 = \overline{S_2} \cdot S_1 \cdot \overline{S_0}$              (Code 010: GateMDR)
+  $Y_3 = \overline{S_2} \cdot S_1 \cdot S_0$                         (Code 011: GateALU)
+  $Y_4 = S_2 \cdot \overline{S_1} \cdot \overline{S_0}$              (Code 100: GateMARMUX)
+
+By mathematical definition, for ANY 3-bit binary input, **EXACTLY ONE** output line
+will be 1, and all 7 others will be 0! This physically guarantees that two gates can
+never short-circuit the bus.
+
+--------------------------------------------------------------------------------
+E. Gate Gating vs. Load Enables
+--------------------------------------------------------------------------------
+Why can gates use a 3-bit selector code, while load enables cannot?
+• Driving the bus is **mutually exclusive** (only one source can drive).
+• Reading from the bus is **non-exclusive** (multiple registers can latch simultaneously).
+
+In State 35 (Fetch Cycle 3):
+• Driver: `GateMDR = 1` (Gate Code `0b010`).
+• Destinations: `LD_IR = 1` (latch instruction) AND `LD_PC = 1` (increment PC).
+Both registers capture the bus data on the exact same rising clock edge!
+Therefore, `LD_IR` and `LD_PC` must be independent 1-bit wires.
+
+--------------------------------------------------------------------------------
+F. Anatomy of a Packed 32-Bit Micro-Instruction ROM Word
+--------------------------------------------------------------------------------
+In Version 3.4, each micro-instruction is packed into a physical 32-bit binary integer:
+
+  Bit Index:
+  [31:26] Next State Address J (6 bits: 0..63)
+  [25:24] Next State Condition COND (2 bits: 00=UNCOND, 01=OPCODE, 10=READY)
+  [23:21] Gate Selector Code (3 bits: 000=NONE, 001=PC, 010=MDR, 011=ALU, 100=MARMUX)
+  [20]    LD_MAR (1 bit: 0 or 1)
+  [19]    LD_MDR (1 bit: 0 or 1)
+  [18]    LD_IR  (1 bit: 0 or 1)
+  [17]    LD_PC  (1 bit: 0 or 1)
+  [16]    LD_REG (1 bit: 0 or 1)
+  [15]    LD_CC  (1 bit: 0 or 1)
+  [14]    MemRead (1 bit: 0 or 1)
+  [13]    MemWrite (1 bit: 0 or 1)
+  [12:0]  Reserved / Datapath Constants
+
+
+================================================================================
+4. HOW REAL SILICON HARDWARE WORKS (SCHEMATICS & TRUTH TABLES)
+================================================================================
+
+--------------------------------------------------------------------------------
+A. System Bus Architecture Schematic
+--------------------------------------------------------------------------------
+
++==============================================================================+
+|                            CENTRAL PROCESSING UNIT                           |
+|                                                                              |
+|      [ MAR (16-bit Register) ]            [ MDR (16-bit Register) ]          |
+|                 |                                      ^                     |
++=================|======================================|=====================+
+                  |                                      |
+         16-bit Address Bus                     16-bit Data Bus
+                  |                                      |
+                  |                                      |
+                  +--------------+                       |
+                  |              |                       |
+                  v              v                       |
+        +------------------+     |                       |
+        | Address Decoder  |     |                       |
+        +---------+--------+     |                       |
+                  |              |                       |
+                  | RAM_CS       |                       |
+                  v              |                       |
+        +------------------+     |                       |
+        |   DYNAMIC RAM    |<----+                       |
+        |      ARRAY       |                             |
+        +---------+--------+                             |
+                  |                                      |
+                  +--------------------------------------+
+                  | (Bidirectional Data Transfer)
+                  |
+        +---------v--------+
+        |   Control Bus    | <--- [ MEM_READ (1-bit), MEM_WRITE (1-bit), MEM_READY (1-bit) ]
+        +------------------+
+
+--------------------------------------------------------------------------------
+B. Central Internal Bus & 3-to-8 Line Gate Decoder Schematic
+--------------------------------------------------------------------------------
+
+   Control Store ROM
+   [ 3-bit Gate Code ]
+          |
+          | (Lines S2, S1, S0)
+          v
+   +--------------+
+   |    3-to-8    |
+   | Line Decoder |
+   +---+--+--+--+-+
+       |  |  |  |
+       |  |  |  +--> Line 4 (MARMUX) -----[ Tri-State Buffer ]---> [MARMUX Output]
+       |  |  +-----> Line 3 (ALU)    -----[ Tri-State Buffer ]---> [ALU Output]
+       |  +--------> Line 2 (MDR)    -----[ Tri-State Buffer ]---> [MDR Latch]
+       +-----------> Line 1 (PC)     -----[ Tri-State Buffer ]---> [PC Latch]
+                                                    |
+                                                    v
+                                      [ CENTRAL 16-BIT INTERNAL BUS ]
+                                                    |
+                       +----------------------------+-----------------------+
+                       |                            |                       |
+                       v                            v                       v
+                  [ LD_MAR=1 ]                 [ LD_IR=1 ]             [ LD_REG=1 ]
+                     (MAR)                        (IR)                 (RegFile[DR])
+
+--------------------------------------------------------------------------------
+C. 3-to-8 Gate Decoder Truth Table
+--------------------------------------------------------------------------------
+
+3-bit Gate Code | Decoded Line Active | Tri-State Driver Enabled | Bus Status
+----------------+---------------------+--------------------------+-----------------------
+000 (0)         | Line 0 (HIGH)       | None (All Buffers Hi-Z)  | Floating (Hi-Z)
+001 (1)         | Line 1 (HIGH)       | GatePC                   | BUS <= PC
+010 (2)         | Line 2 (HIGH)       | GateMDR                  | BUS <= MDR
+011 (3)         | Line 3 (HIGH)       | GateALU                  | BUS <= ALU Output
+100 (4)         | Line 4 (HIGH)       | GateMARMUX               | BUS <= Effective Addr
+
+--------------------------------------------------------------------------------
+D. Complete Micro-Instruction ROM Control Bit Matrix
+--------------------------------------------------------------------------------
+
+uPC | State Name    | GateCode | Gate Name  | LD_MAR | LD_MDR | LD_IR | LD_PC | LD_REG | LD_CC | MemRead | MemWrite
+----+---------------+----------+------------+--------+--------+-------+-------+--------+-------+---------+---------
+18  | FETCH_1       | 0b001    | GatePC     |   1    |   0    |   0   |   0   |   0    |   0   |    1    |    0
+33  | FETCH_2       | 0b000    | NONE       |   0    |   1    |   0   |   0   |   0    |   0   |    1    |    0
+35  | FETCH_3       | 0b010    | GateMDR    |   0    |   0    |   1   |   1   |   0    |   0   |    0    |    0
+32  | DECODE        | 0b000    | NONE       |   0    |   0    |   0   |   0   |   0    |   0   |    0    |    0
+1   | ADD_EXEC_WB   | 0b011    | GateALU    |   0    |   0    |   0   |   0   |   1    |   1   |    0    |    0
+2   | LD_ADDR_CALC  | 0b100    | GateMARMUX |   1    |   0    |   0   |   0   |   0    |   0   |    1    |    0
+25  | LD_MEM_READ   | 0b010    | GateMDR    |   0    |   1    |   0   |   0   |   1    |   1   |    1    |    0
+
+--------------------------------------------------------------------------------
+E. Micro-Cycle Handshaking Sequence across the 3 System Buses
+--------------------------------------------------------------------------------
+
+Step | Actor           Address Bus (16-bit) | Data Bus (16-bit)     | Control Bus (1-bit)
+-----+-----------------+--------------------+-----------------------+---------------------
+1    | CPU Core        Drives MAR = 0x3000  | High-Impedance (Hi-Z) | Asserts MEM_READ=1
+2    | Address Decoder Inspects 0x3000      | Floats                | Asserts RAM_CS=1
+3    | Dynamic RAM     Selects row 0x3000   | Drives data (0x2204)  | Asserts MEM_READY=1
+4    | CPU Core        Reads Data Bus       | Captures into MDR     | Deasserts MEM_READ=0
+5    | System Bus      Lines return to idle | Floats back to Hi-Z   | All lines clear (0)
+
+
+================================================================================
+5. HOW THESE CONCEPTS ASSIST PROGRAM EXECUTION & RELIABILITY
+================================================================================
+
+1. Electrical Isolation:
+   Tri-state buffers isolate unselected devices completely, ensuring electrical
+   current cannot back-feed into inactive circuits.
+
+2. Deterministic Gating:
+   By using a 3-bit binary gate code, the hardware mathematically eliminates the
+   possibility of conflicting driver assertions.
+
+3. Clean Architectural Layering:
+   The CPU core handles registers and ALU computations; the internal bus moves data
+   between them; and the 3-part system bus interacts with system RAM and peripherals.
+
+
+================================================================================
+6. IMPLEMENTATION IN VERSION 3.4 CODEBASE
+================================================================================
+
+1. `memory/system-bus.js`:
+   • `AddressBus`: Models 16-bit parallel copper traces ($A_{15} \dots A_0$).
+   • `DataBus`: Models 16-bit bidirectional wires ($D_{15} \dots D_0$) with `float()` (Hi-Z).
+   • `ControlBus`: Models individual 1-bit wires (`MEM_READ`, `MEM_WRITE`, `MEM_READY`).
+   • `SystemBus`: Orchestrates read and write cycles across all three physical buses.
+
+2. `cpu/internal-bus.js`:
+   • Implements `InternalBus.decode3to8(gateCode)` simulating the hardware decoder.
+   • `driveWithGate(gateCode, value)` drives the central bus via the 3-bit code.
+
+3. `cpu/micro-sequencer.js`:
+   • `CONTROL_STORE_ROM` updated with `gateCode` (000..100) and strict `0`/`1` signals.
+   • `MicroSequencer.packMicroWord()` packs control signals into 32-bit ROM words.
+
+4. `cpu/cpu-pipeline.js` & `cpu/instruction-describer.js`:
+   • Micro-cycle traces display real-time 3-bus status (`AddressBus`, `DataBus`, `ControlBus`)
+     and internal 3-bit gate decoding.
+================================================================================

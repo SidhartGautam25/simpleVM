@@ -1,0 +1,415 @@
+================================================================================
+         COMPUTER ARCHITECTURE THEORY & CONCEPTS: VERSION 3.3
+        MEMORY-MAPPED I/O (MMIO) & BUS ADDRESS DECODING CIRCUITS
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Introduction & Overview: What Are These Topics?
+2. The Motivating Problem: Why Does Memory-Mapped I/O Exist?
+   A. The Illusion of the High-Level "Print" Statement
+   B. The Silicon Pin Constraint Problem (Von Neumann Bottleneck)
+   C. Port-Mapped I/O (PMIO) vs. Memory-Mapped I/O (MMIO)
+   D. Why Modern Computer Architectures Prefer MMIO
+3. In-Depth Physical & Electrical Theory
+   A. The Memory Address Bus and Tri-State Buffering
+   B. The Electrical Address Decoder Circuit (Logic Gates, Comparators, and Demuxes)
+   C. Chip Select Signals (CS / CE) and Active-Low Enables
+   D. Memory Map Partitioning: RAM Space vs. Device Register Space
+   E. Hardware Device Registers: Control/Status Registers (CSRs) vs. Data Registers
+   F. Polling Protocols, Handshaking, and Hardware Side Effects
+4. How Real Silicon Hardware Works (With Structural Diagrams & Timing)
+   A. Detailed Structural Diagram: CPU, Address Decoder, RAM, and Peripheral Chips
+   B. The LC-3 Memory Map Architecture
+   C. Keyboard Interface Protocol: Step-by-Step Electrical Flow
+   D. Display Interface Protocol: Step-by-Step Electrical Flow
+5. How These Concepts Assist Program Execution & System Software
+   A. Device Drivers and Memory Abstraction
+   B. Polling Loops in Assembly Language
+   C. Hardware Independence and Uniform Address Space
+6. Implementation in Version 3.3 Codebase
+   A. `memory/address-decoder.js` (The Hardware Decoder Circuit)
+   B. `memory/bus-interface.js` (Mediating Bus Cycles via Chip Selects)
+   C. `cpu/cpu-pipeline.js` (Decoding Telemetry in Pipeline States)
+   D. `vm.js` (Peripheral Simulation and MMIO APIs)
+
+
+================================================================================
+1. INTRODUCTION & OVERVIEW: WHAT ARE THESE TOPICS?
+================================================================================
+
+In beginner programming models, Input and Output (I/O) are usually taken for
+granted: a programmer calls `console.log("Hello")` in JavaScript or `printf()` in C,
+and characters magically appear on a screen.
+
+However, inside a real physical silicon microprocessor:
+  • The central processing unit (CPU) consists solely of digital logic gates,
+    registers, an Arithmetic Logic Unit (ALU), and external bus connection pins.
+  • The CPU has NO internal screen, NO physical keyboard connection, and NO hardware
+    "print" instruction.
+  • The CPU is merely connected to external electronic pins: an Address Bus, a
+    Data Bus, and a few Control wires (`MemRead`, `MemWrite`, `Clock`).
+
+How does a CPU communicate with the physical outside world?
+The answer is MEMORY-MAPPED I/O (MMIO) and BUS ADDRESS DECODING.
+
+Key Concepts Introduced:
+1. Address Decoder (`AddressDecoder`):
+   A dedicated combinational logic circuit placed between the CPU's Memory Address
+   Register (MAR) and external devices. It continuously inspects the binary
+   bit-pattern on the Address Bus to activate the appropriate chip select line
+   (`RAM_CS` or `IO_CS`).
+
+2. Memory-Mapped I/O (MMIO):
+   A hardware architecture where external device registers are mapped to specific,
+   reserved numerical addresses within the CPU's physical memory space. Instead of
+   creating new CPU instructions, normal memory read and write instructions (`LD`,
+   `ST`, `LDR`, `STR`) are used to communicate with keyboards, screens, network
+   cards, and disks.
+
+3. Hardware Device Registers:
+   Physical flip-flop registers located inside external peripheral controllers:
+     • Status Registers (e.g., `KBSR`, `DSR`): Communicate peripheral readiness,
+       errors, or busy states.
+     • Data Registers (e.g., `KBDR`, `DDR`): Hold data bytes being received from
+       or transmitted to peripherals.
+
+4. Hardware Side Effects:
+   Reading or writing to an MMIO register often causes physical state changes in the
+   hardware controller. For example, reading the Keyboard Data Register (`KBDR`)
+   automatically clears the ready bit in the Keyboard Status Register (`KBSR`).
+
+
+================================================================================
+2. THE MOTIVATING PROBLEM: WHY DOES MEMORY-MAPPED I/O EXIST?
+================================================================================
+
+--------------------------------------------------------------------------------
+A. The Illusion of the High-Level "Print" Statement
+--------------------------------------------------------------------------------
+In software languages, printing text appears instantaneous and atomic. In reality,
+a computer screen is an independent physical device with its own internal timing,
+refresh cycles (e.g., 60 Hz or 144 Hz), and raster scan buffers. A physical keyboard
+is an asynchronous matrix of physical mechanical switches that oscillate and bounce
+when struck by human fingers.
+
+Because the CPU operates at gigahertz or megahertz speeds while human typing occurs
+at only a few characters per second, the CPU and peripherals cannot be wired
+directly together. They require standardized buffer registers and status indicators.
+
+--------------------------------------------------------------------------------
+B. The Silicon Pin Constraint Problem (Von Neumann Bottleneck)
+--------------------------------------------------------------------------------
+Every integrated circuit (chip) is physically bounded by the number of external
+metal pins or solder balls (ball-grid array) on its package:
+  • If a processor had dedicated physical wires for the keyboard, dedicated wires
+    for the display, dedicated wires for the mouse, and dedicated wires for disk drives,
+    the CPU package would require thousands of physical pins, drastically increasing
+    chip size, manufacturing cost, power dissipation, and capacitive interference.
+  • By utilizing a unified SYSTEM BUS (Address Bus, Data Bus, Control Bus), the CPU
+    interacts with ALL components (RAM, ROM, and every peripheral) using the exact
+    same set of physical metal pins.
+
+--------------------------------------------------------------------------------
+C. Port-Mapped I/O (PMIO) vs. Memory-Mapped I/O (MMIO)
+--------------------------------------------------------------------------------
+Historically, computer architects developed two competing methods for peripheral
+communication:
+
+1. Port-Mapped I/O (PMIO / Isolated I/O):
+   • Used in Intel x86 architectures (`IN` and `OUT` assembly instructions).
+   • The CPU features a dedicated control pin called `M/IO#` (Memory vs. I/O).
+   • When executing `MOV [addr], EAX`, `M/IO#` is driven HIGH (targeting RAM).
+   • When executing `OUT dx, al`, `M/IO#` is driven LOW (targeting I/O ports).
+   • Disadvantages: Requires special, dedicated CPU opcodes; complicates the
+     instruction decoder; separate address space cannot use powerful memory
+     addressing modes (indirect, indexed, base-offset).
+
+2. Memory-Mapped I/O (MMIO):
+   • Used in LC-3, ARM, RISC-V, MIPS, Motorola 68000, and MOS 6502 (Apple II, NES).
+   • No special CPU instructions are required.
+   • A portion of the standard memory address space is reserved for hardware devices.
+   • Advantages:
+     - Pure architectural simplicity: The CPU's ALU, pipeline, and decoder remain
+       completely unaware of whether they are talking to RAM or a keyboard!
+     - Every existing memory addressing mode can directly manipulate device registers.
+     - Fewer silicon gates required in the core CPU.
+
+--------------------------------------------------------------------------------
+D. Why Modern Computer Architectures Prefer MMIO
+--------------------------------------------------------------------------------
+Modern high-performance architectures (such as ARM64, Apple Silicon, and PCI-Express
+graphics cards) use MMIO exclusively. Graphics memory (VRAM), NVMe SSD controllers,
+and Gigabit Ethernet adapters map gigabytes of internal registers straight into the
+64-bit physical address space, allowing CPU load and store instructions to write
+directly to peripheral hardware at full bus bandwidth.
+
+
+================================================================================
+3. IN-DEPTH PHYSICAL & ELECTRICAL THEORY
+================================================================================
+
+--------------------------------------------------------------------------------
+A. The Memory Address Bus and Tri-State Buffering
+--------------------------------------------------------------------------------
+The Memory Address Bus consists of 16 parallel physical copper traces on the
+motherboard printed circuit board (PCB), designated $A_{15}, A_{14}, \dots, A_0$:
+  • The Memory Address Register (MAR) drives binary voltage levels (0V for logic 0,
+    3.3V for logic 1) onto these copper traces.
+  • Multiple physical chips (RAM chips, ROM chips, UART controllers, Display controllers)
+    are connected in parallel to these exact same copper traces.
+  • To prevent multiple devices from driving the bidirectional Data Bus at the same
+    time (which would cause a catastrophic electrical short circuit), every peripheral
+    contains TRI-STATE BUFFERS (High-Impedance / Hi-Z state) controlled by a
+    CHIP SELECT line.
+
+--------------------------------------------------------------------------------
+B. The Electrical Address Decoder Circuit
+--------------------------------------------------------------------------------
+The Address Decoder is a combinational logic circuit constructed from binary
+comparators, AND gates, and NOT gates:
+
+In our 16-bit virtual machine architecture:
+• Address space: $2^{16} = 65,536$ addresses (0x0000 to 0xFFFF).
+• Notice the hexadecimal breakdown:
+    - 0x0000 to 0xFDFF:
+      Binary: `0000 0000 0000 0000` to `1111 1101 1111 1111`
+    - 0xFE00 to 0xFFFF:
+      Binary: `1111 1110 0000 0000` to `1111 1111 1111 1111`
+
+Observe bits [15:9] for MMIO addresses (0xFE00 to 0xFFFF):
+Every address from 0xFE00 to 0xFFFF has bits:
+  $A_{15} = 1, A_{14} = 1, A_{13} = 1, A_{12} = 1, A_{11} = 1, A_{10} = 1, A_9 = 1$.
+
+An electrical Address Decoder detects this with a 7-input AND gate:
+  $IO\_ENABLE = A_{15} \cdot A_{14} \cdot A_{13} \cdot A_{12} \cdot A_{11} \cdot A_{10} \cdot A_9$
+
+When $IO\_ENABLE = 1$:
+  • Device Chip Select ($IO\_CS$) is asserted HIGH.
+  • RAM Chip Select ($RAM\_CS$) is deasserted LOW.
+  • The lower address bits ($A_2, A_1, A_0$) enter a 3-to-8 line demultiplexer to
+    select between KBSR, KBDR, DSR, and DDR.
+
+--------------------------------------------------------------------------------
+C. Chip Select Signals (CS / CE) and Active-Low Enables
+--------------------------------------------------------------------------------
+Real silicon memory chips feature a physical pin labeled $\overline{CS}$ (Chip Select)
+or $\overline{CE}$ (Chip Enable). The overbar denotes "Active-Low":
+  • When $\overline{CS} = 0V$ (Active): The chip connects its internal storage
+    cells to the data bus and responds to `MemRead` or `MemWrite`.
+  • When $\overline{CS} = 3.3V$ (Inactive): The chip completely disconnects its
+    data pins, floating them into high impedance ($Hi\text{-}Z$), ignoring all
+    read and write strobes.
+
+--------------------------------------------------------------------------------
+D. Memory Map Partitioning: RAM Space vs. Device Register Space
+--------------------------------------------------------------------------------
+The physical memory map of the LC-3 is cleanly partitioned:
+
+  +---------------------------------------+ 0x0000 (0)
+  |                                       |
+  |        Operating System & Traps       |
+  |                                       |
+  +---------------------------------------+ 0x3000 (12288)
+  |                                       |
+  |        User Program & Data Space      |
+  |        (Dynamic RAM Array)            |
+  |                                       |
+  +---------------------------------------+ 0xFDFF (65023)
+  |=======================================|
+  |   MEMORY-MAPPED I/O DEVICE REGISTERS  | 0xFE00 (65024)
+  |   • 0xFE00: KBSR (Keyboard Status)   |
+  |   • 0xFE02: KBDR (Keyboard Data)     |
+  |   • 0xFE04: DSR  (Display Status)    |
+  |   • 0xFE06: DDR  (Display Data)      |
+  |   • 0xFE08 - 0xFFFF: Reserved Devices |
+  +---------------------------------------+ 0xFFFF (65535)
+
+--------------------------------------------------------------------------------
+E. Hardware Device Registers: CSRs vs. Data Registers
+--------------------------------------------------------------------------------
+Hardware peripherals require a two-register pair for robust communication:
+1. Control and Status Register (CSR):
+   • Contains one or more status flags indicating physical hardware condition.
+   • Bit 15 is standardized as the READY BIT ($1 = \text{Ready}, 0 = \text{Busy}$).
+2. Data Register:
+   • Contains the actual payload (ASCII character, network packet byte, sensor reading).
+
+Why is this pairing necessary?
+If there were only a Data Register without a Status Register, the CPU would have
+no way of knowing whether the byte in the data register was fresh new data or stale
+data from an earlier keystroke!
+
+--------------------------------------------------------------------------------
+F. Polling Protocols, Handshaking, and Hardware Side Effects
+--------------------------------------------------------------------------------
+A Polling Handshake protocol proceeds as follows:
+
+1. Keyboard Input Protocol:
+   • Step 1: User strikes a mechanical key on the keyboard.
+   • Step 2: Keyboard encoder hardware latches the ASCII value into `KBDR`.
+   • Step 3: Keyboard hardware asserts the Ready Bit: `KBSR[15] = 1`.
+   • Step 4: CPU repeatedly reads `KBSR` until bit 15 becomes 1.
+   • Step 5: CPU reads `KBDR` to obtain the character.
+   • Step 6 (Hardware Side Effect): Reading `KBDR` causes the address decoder to
+     pulse a reset wire that clears `KBSR[15] = 0`. The hardware is once again idle!
+
+2. Display Output Protocol:
+   • Step 1: CPU reads `DSR` to verify Bit [15] is 1 (Display ready).
+   • Step 2: CPU writes ASCII character into `DDR`.
+   • Step 3 (Hardware Side Effect): Writing `DDR` pulses the display controller,
+     rendering the character onto the monitor and momentarily clearing `DSR[15] = 0`
+     until the display hardware finishes drawing the pixel glyph.
+
+
+================================================================================
+4. HOW REAL SILICON HARDWARE WORKS (WITH DIAGRAMS & TIMING)
+================================================================================
+
+--------------------------------------------------------------------------------
+A. Detailed Structural Diagram: CPU, Address Decoder, RAM, and Peripherals
+--------------------------------------------------------------------------------
+
++==============================================================================+
+|                            CENTRAL PROCESSING UNIT                           |
+|                                                                              |
+|       [ MAR (Memory Address Register) ]   [ MDR (Memory Data Register) ]     |
+|                      |                                   ^                   |
++======================|===================================|===================+
+                       |                                   |
+             16-bit Address Bus                   16-bit Bidirectional Data Bus
+                       |                                   |
+                       v                                   |
+     +-----------------------------------+                 |
+     |        BUS ADDRESS DECODER        |                 |
+     |                                   |                 |
+     | Range Comparator:                 |                 |
+     |  0x0000 - 0xFDFF -> Assert RAM_CS |                 |
+     |  0xFE00 - 0xFFFF -> Assert IO_CS  |                 |
+     +--------+------------------+-------+                 |
+              |                  |                         |
+              | RAM_CS           | IO_CS                   |
+              |                  |                         |
+              v                  v                         |
+     +-----------------+   +---------------------------------------+
+     |   DYNAMIC RAM   |   |        MMIO PERIPHERAL CHIPS          |
+     |      ARRAY      |   |                                       |
+     |                 |   |  0xFE00: [ KBSR (Keyboard Status) ]   |
+     | (Addresses:     |   |  0xFE02: [ KBDR (Keyboard Data)   ]   |
+     |  0x0000-0xFDFF) |   |  0xFE04: [ DSR  (Display Status)  ]   |
+     |                 |   |  0xFE06: [ DDR  (Display Data)    ]   |
+     +--------+--------+   +-------------------+-------------------+
+              |                                |
+              +----------------+---------------+
+                               |
+                               v
+                     (Connects to Data Bus)
+
+--------------------------------------------------------------------------------
+B. The LC-3 Memory Map Architecture
+--------------------------------------------------------------------------------
+Address  Device  Direction  Description
+-------  ------  ---------  ----------------------------------------------------
+0xFE00   KBSR    Read-only  Keyboard Status: Bit 15 is 1 if new key is available
+0xFE02   KBDR    Read-only  Keyboard Data: Bits 7..0 hold ASCII keycode
+0xFE04   DSR     Read-only  Display Status: Bit 15 is 1 if display is ready
+0xFE06   DDR     Write-only Display Data: Bits 7..0 hold ASCII char to display
+
+--------------------------------------------------------------------------------
+C. Keyboard Interface Protocol: Step-by-Step Electrical Flow
+--------------------------------------------------------------------------------
+
+Time   Actor           Bus Action
+-----  --------------  ---------------------------------------------------------
+T0     User            Strikes 'A' key on physical keyboard.
+T1     Keyboard Chip   Latches ASCII 65 into KBDR, raises KBSR[15] to 3.3V (HIGH).
+T2     CPU             Drives MAR = 0xFE00, strobes MemRead = 1.
+T3     AddressDecoder  Detects 0xFE00 -> Asserts IO_CS -> KBSR drives Data Bus.
+T4     CPU             MDR latches 0x8000. CPU tests bit 15: non-zero (Ready!).
+T5     CPU             Drives MAR = 0xFE02, strobes MemRead = 1.
+T6     AddressDecoder  Detects 0xFE02 -> Asserts IO_CS -> KBDR drives Data Bus (65).
+T7     AddressDecoder  *SIDE EFFECT*: Clears KBSR[15] back to 0V (LOW).
+T8     CPU             MDR latches 65 ('A'). Keystroke successfully received!
+
+--------------------------------------------------------------------------------
+D. Display Interface Protocol: Step-by-Step Electrical Flow
+--------------------------------------------------------------------------------
+
+Time   Actor           Bus Action
+-----  --------------  ---------------------------------------------------------
+T0     CPU             Drives MAR = 0xFE04, strobes MemRead = 1.
+T1     AddressDecoder  Detects 0xFE04 -> Asserts IO_CS -> DSR drives Data Bus.
+T2     CPU             MDR latches 0x8000. CPU tests bit 15: non-zero (Display Ready!).
+T3     CPU             Drives MAR = 0xFE06, MDR = 0x0048 ('H'), strobes MemWrite = 1.
+T4     AddressDecoder  Detects 0xFE06 -> Asserts IO_CS -> DDR captures 0x0048.
+T5     Display Chip    *SIDE EFFECT*: Character 'H' is pushed to the physical screen.
+
+
+================================================================================
+5. HOW THESE CONCEPTS ASSIST PROGRAM EXECUTION & SYSTEM SOFTWARE
+================================================================================
+
+1. Device Driver Implementation:
+   In real operating systems (Linux, Windows, macOS), device drivers are simply
+   software modules that read and write to specific MMIO addresses. A graphics
+   driver writes framebuffers to MMIO addresses; an Ethernet driver reads packet
+   buffers from MMIO addresses.
+
+2. Elimination of High-Level Magic:
+   Without MMIO, computer simulators must cheat by intercepting instructions and
+   calling host OS runtime functions (`console.log`, `printf`). With MMIO, the
+   simulator runs 100% self-contained: the CPU manipulates hardware wires, and the
+   peripherals respond purely based on bus transitions!
+
+3. Assembly Language Polling Loop:
+   A standard LC-3 assembly routine to read a character from the keyboard:
+
+     POLL_KEY:
+       LDI R0, KBSR_ADDR    ; Read KBSR into R0 via MMIO (0xFE00)
+       BRzp POLL_KEY        ; If bit 15 is 0 (positive or zero), keep polling!
+       LDI R0, KBDR_ADDR    ; Bit 15 was 1! Read character from KBDR (0xFE02)
+
+
+================================================================================
+6. IMPLEMENTATION IN VERSION 3.3 CODEBASE
+================================================================================
+
+--------------------------------------------------------------------------------
+A. `memory/address-decoder.js` (The Hardware Decoder Circuit)
+--------------------------------------------------------------------------------
+• Class `AddressDecoder`:
+  - `decode(address)`: Classifies address into `{ target: 'RAM' | 'DEVICE', ramChipSelect, deviceChipSelect, deviceName }`.
+  - `read(address, latches)`: Mediates bus reads. Routes to `this.ram[address]` or
+    device registers (`kbsr`, `kbdr`, `dsr`, `ddr`).
+    - Enforces automatic ready-bit clearing on `KBDR` read.
+  - `write(address, data, latches)`: Mediates bus writes.
+    - If `DDR` (0xFE06), appends ASCII character to `this.displayBuffer`.
+  - `typeChar(char)` / `queueInput(text)`: Peripheral simulation methods that
+    set the ready bit and load `KBDR`.
+
+--------------------------------------------------------------------------------
+B. `memory/bus-interface.js` (Mediating Bus Cycles via Chip Selects)
+--------------------------------------------------------------------------------
+• `MemoryBusInterface` holds an instance of `AddressDecoder`.
+• `readCycle(latches, memRead)`: Routes through `this.addressDecoder.read()`.
+• `writeCycle(latches, memWrite)`: Routes through `this.addressDecoder.write()`.
+• `this.lastTransaction`: Records `ramChipSelect`, `deviceChipSelect`, and `target`
+  for cycle-accurate telemetry.
+
+--------------------------------------------------------------------------------
+C. `cpu/cpu-pipeline.js` (Decoding Telemetry in Pipeline States)
+--------------------------------------------------------------------------------
+• States 18, 33, 2, and 25 record the real-time chip select assertions in the
+  hardware event trace:
+  `[Clock 1 | uPC: 18] Address Decoder: Physical RAM [0x3000] -> Assert RAM_CS`
+  `[Clock 5 | uPC: 2] Address Decoder: Hardware Device Register: KBSR [0xFE00] -> Assert IO_CS`
+
+--------------------------------------------------------------------------------
+D. `vm.js` (Peripheral Simulation and MMIO APIs)
+--------------------------------------------------------------------------------
+• `vm.typeChar(char)`: Types a simulated key on the physical keyboard.
+• `vm.getDisplayOutput()`: Retrieves all text rendered on the physical display screen.
+• `vm.readMemory(address)` / `vm.writeMemory(address, value)`: Conducts hardware
+  bus cycles via MAR and MDR mediated by the Address Decoder.
+• `vm.mmioState`: Exposes live status of all device registers for debugging.
+================================================================================
