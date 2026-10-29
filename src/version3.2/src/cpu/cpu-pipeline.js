@@ -38,15 +38,6 @@ export class CpuPipeline {
 
     // In-flight instruction micro-state
     this.currentInstruction = this._createEmptyInstructionState();
-
-    // Stage registers for backward compatibility
-    this.stageRegisters = {
-      IF: null,
-      ID: null,
-      EX: null,
-      MEM: null,
-      WB: null,
-    };
   }
 
   _createEmptyInstructionState() {
@@ -61,6 +52,7 @@ export class CpuPipeline {
       aluOutput: null,
       effectiveAddress: null,
       loadedValue: null,
+      writeRecord: null,
       hardwareEvents: [],
       cycleRecords: [],
     };
@@ -73,13 +65,6 @@ export class CpuPipeline {
     this.internalBus.reset();
     this.microSequencer.reset();
     this.currentInstruction = this._createEmptyInstructionState();
-    this.stageRegisters = {
-      IF: null,
-      ID: null,
-      EX: null,
-      MEM: null,
-      WB: null,
-    };
   }
 
   /**
@@ -177,14 +162,6 @@ export class CpuPipeline {
           `[Clock ${cycleNum} | uPC: 35 (${microInst.name})] Program Counter (PC) <= ${nextPc} (Incremented PC)`
         );
 
-        this.stageRegisters.IF = {
-          stage: 'IF',
-          pc: this.currentInstruction.fetchPc,
-          nextPc,
-          rawInstruction: this.currentInstruction.rawInstruction,
-          hardwareEvents: [...this.currentInstruction.hardwareEvents, ...cycleEvents],
-        };
-
         this.microSequencer.step();
         break;
       }
@@ -238,18 +215,6 @@ export class CpuPipeline {
           );
         }
 
-        this.stageRegisters.ID = {
-          stage: 'ID',
-          pc: this.currentInstruction.fetchPc,
-          nextPc: this.currentInstruction.nextPc,
-          rawInstruction: this.currentInstruction.rawInstruction,
-          decoded,
-          control,
-          sr1Val,
-          sr2Val,
-          hardwareEvents: cycleEvents,
-        };
-
         this.microSequencer.step({ opcode: decoded.opcode });
         break;
       }
@@ -293,31 +258,7 @@ export class CpuPipeline {
           `[Clock ${cycleNum} | uPC: 1 (${microInst.name})] PSR Latch <= 0b${this.latches.PSR.toString(2).padStart(3, '0')} (LD_CC: ENABLED, updated from ALU flags)`
         );
 
-        this.stageRegisters.EX = {
-          ...this.stageRegisters.ID,
-          stage: 'EX',
-          aluInputA,
-          aluInputB,
-          aluOutput,
-          effectiveAddress: null,
-          hardwareEvents: cycleEvents,
-        };
-
-        this.stageRegisters.MEM = {
-          ...this.stageRegisters.EX,
-          stage: 'MEM',
-          loadedValue: null,
-          hardwareEvents: [],
-        };
-
-        this.stageRegisters.WB = {
-          ...this.stageRegisters.MEM,
-          stage: 'WB',
-          writeData,
-          writeRecord,
-          hardwareEvents: cycleEvents,
-        };
-
+        this.currentInstruction.writeRecord = writeRecord;
         instructionComplete = true;
         this.microSequencer.step(); // Returns to State 18
         break;
@@ -348,16 +289,6 @@ export class CpuPipeline {
           `[Clock ${cycleNum} | uPC: 2 (${microInst.name})] Central Internal Bus: GateMARMUX=1 -> BUS <= ${effectiveAddress} -> LD_MAR=1 -> MAR <= BUS (${effectiveAddress})`,
           `[Clock ${cycleNum} | uPC: 2 (${microInst.name})] External Memory Bus: MemRead=1 asserted for address ${effectiveAddress}`
         );
-
-        this.stageRegisters.EX = {
-          ...this.stageRegisters.ID,
-          stage: 'EX',
-          aluInputA,
-          aluInputB,
-          aluOutput,
-          effectiveAddress,
-          hardwareEvents: cycleEvents,
-        };
 
         this.microSequencer.step(); // Advances to State 25
         break;
@@ -396,21 +327,7 @@ export class CpuPipeline {
           `[Clock ${cycleNum} | uPC: 25 (${microInst.name})] PSR Latch <= 0b${this.latches.PSR.toString(2).padStart(3, '0')} (LD_CC: ENABLED, updated from BUS value ${writeData})`
         );
 
-        this.stageRegisters.MEM = {
-          ...this.stageRegisters.EX,
-          stage: 'MEM',
-          loadedValue,
-          hardwareEvents: cycleEvents,
-        };
-
-        this.stageRegisters.WB = {
-          ...this.stageRegisters.MEM,
-          stage: 'WB',
-          writeData,
-          writeRecord,
-          hardwareEvents: cycleEvents,
-        };
-
+        this.currentInstruction.writeRecord = writeRecord;
         instructionComplete = true;
         this.microSequencer.step(); // Returns to State 18
         break;
@@ -465,7 +382,7 @@ export class CpuPipeline {
       result: inst.aluOutput ? inst.aluOutput.result : writeData,
       controlSignals: inst.control,
       aluOutput: inst.aluOutput,
-      writeRecord: this.stageRegisters.WB ? this.stageRegisters.WB.writeRecord : null,
+      writeRecord: inst.writeRecord || null,
       hardwareEvents: inst.hardwareEvents,
       allHardwareEvents: inst.hardwareEvents,
       cycleRecords: inst.cycleRecords,
@@ -478,7 +395,6 @@ export class CpuPipeline {
       decoded: inst.decoded,
       controlSignals: inst.control,
       execution,
-      stages: this.stageRegisters,
       internalBus: this.internalBus.lastTransaction,
       cyclesTaken: inst.cycleRecords.length,
       microCycles: inst.cycleRecords,
@@ -508,225 +424,6 @@ export class CpuPipeline {
     return tickResult.finishedInstructionData;
   }
 
-  executeInstruction() {
-    return this.step();
-  }
 
-  // --- High-level phase methods for backward compatibility ---
 
-  phaseFetch() {
-    const fetchPc = this.latches.PC;
-    this.internalBus.drive('PC', fetchPc);
-    this.latches.latchMAR(this.internalBus.read());
-    const rawInstruction = this.bus.readCycle(this.latches, true);
-    this.internalBus.drive('MDR', rawInstruction);
-    this.latches.latchIR(this.internalBus.read());
-    const nextPc = (fetchPc + 1) & ADDR_MAX;
-    this.latches.latchPC(nextPc);
-
-    const hardwareEvents = [
-      `[IF Stage]  Central Internal Bus: GatePC=1 -> BUS <= PC (${fetchPc})`,
-      `[IF Stage]  Memory Address Register (MAR) <= BUS (${fetchPc}) (LD_MAR: ENABLED, driving Address Bus)`,
-      `[IF Stage]  Memory Bus Interface: Read Cycle active (MemRead: ENABLED) -> Data Bus <= 0b${rawInstruction.toString(2).padStart(16, '0')} -> MDR <= 0x${rawInstruction.toString(16).padStart(4, '0').toUpperCase()}`,
-      `[IF Stage]  Central Internal Bus: GateMDR=1 -> BUS <= MDR (0x${rawInstruction.toString(16).padStart(4, '0').toUpperCase()})`,
-      `[IF Stage]  Instruction Register (IR) <= BUS (LD_IR: ENABLED, instruction latched)`,
-      `[IF Stage]  Program Counter (PC) <= ${nextPc} (Incremented PC)`,
-    ];
-
-    const ifPacket = {
-      stage: 'IF',
-      pc: fetchPc,
-      nextPc,
-      rawInstruction,
-      hardwareEvents,
-    };
-    this.stageRegisters.IF = ifPacket;
-    return ifPacket;
-  }
-
-  phaseDecode(ifStage = this.stageRegisters.IF) {
-    const rawInstruction = ifStage ? ifStage.rawInstruction : this.latches.IR;
-    const currentPc = ifStage ? ifStage.pc : this.latches.PC;
-    const nextPc = ifStage ? ifStage.nextPc : (this.latches.PC + 1) & ADDR_MAX;
-
-    const decoded = InstructionDecoder.decode(rawInstruction);
-    const control = ControlUnit.generateSignals(decoded);
-
-    let sr1Val = 0;
-    let sr2Val = 0;
-    if (decoded.sr1 !== undefined) {
-      sr1Val = this.regFile.readPortA(decoded.sr1);
-    }
-    if (decoded.sr2 !== undefined && !decoded.immFlag) {
-      sr2Val = this.regFile.readPortB(decoded.sr2);
-    }
-
-    const busGatesSummary = `GateALU=${control.GateALU ? 1 : 0}, GateMDR=${control.GateMDR ? 1 : 0}, LD_REG=${control.LD_REG ? 1 : 0}, LD_CC=${control.LD_CC ? 1 : 0}`;
-    const hardwareEvents = [
-      `[ID Stage]  Control Unit: RegWrite=${control.RegWrite ? 1 : 0}, ALUSrc=${control.ALUSrc}, MemRead=${control.MemRead ? 1 : 0}, MemWrite=${control.MemWrite ? 1 : 0}, ALUOp=${control.ALUOp}`,
-      `[ID Stage]  Control Unit Bus Gates: ${busGatesSummary}`,
-    ];
-
-    if (decoded.opcode === OPCODE.ADD) {
-      hardwareEvents.push(`[ID Stage]  Register File (GPR): Read Port A <= R${decoded.sr1} (${sr1Val})`);
-      if (decoded.immFlag) {
-        const immStr = decoded.imm5 >= 0 ? `+${decoded.imm5}` : `${decoded.imm5}`;
-        hardwareEvents.push(`[ID Stage]  Sign-Extension Unit (SEXT5): Imm5 <= ${immStr}`);
-      } else {
-        hardwareEvents.push(`[ID Stage]  Register File (GPR): Read Port B <= R${decoded.sr2} (${sr2Val})`);
-      }
-    } else if (decoded.opcode === OPCODE.LD) {
-      const offsetStr = decoded.pcOffset9 >= 0 ? `+${decoded.pcOffset9}` : `${decoded.pcOffset9}`;
-      hardwareEvents.push(`[ID Stage]  Sign-Extension Unit (SEXT9): PCoffset9 <= ${offsetStr}`);
-    }
-
-    const idPacket = {
-      stage: 'ID',
-      pc: currentPc,
-      nextPc,
-      rawInstruction,
-      decoded,
-      control,
-      sr1Val,
-      sr2Val,
-      hardwareEvents,
-    };
-    this.stageRegisters.ID = idPacket;
-    return idPacket;
-  }
-
-  phaseExecute(idStage = this.stageRegisters.ID) {
-    const { decoded, control, sr1Val, sr2Val, nextPc } = idStage;
-    const hardwareEvents = [];
-
-    let aluInputA = 0;
-    let aluInputB = 0;
-    let aluOutput = null;
-    let effectiveAddress = null;
-
-    if (decoded.opcode === OPCODE.ADD) {
-      aluInputA = sr1Val;
-      aluInputB = control.ALUSrc === 'IMM' ? decoded.imm5 : sr2Val;
-      aluOutput = ALU.compute(aluInputA, aluInputB, control.ALUOp);
-
-      const immStr = decoded.imm5 >= 0 ? `+${decoded.imm5}` : `${decoded.imm5}`;
-      const aluSrcDesc = decoded.immFlag
-        ? `ALUSrc MUX <= SEXT5 Imm5 (${immStr})`
-        : `ALUSrc MUX <= RegFile Port B (R${decoded.sr2} = ${sr2Val})`;
-
-      hardwareEvents.push(`[EX Stage]  ${aluSrcDesc}`);
-      hardwareEvents.push(
-        `[EX Stage]  ALU Execution: ${sr1Val} ${control.ALUOp} ${aluInputB} = ${aluOutput.result} (Flags: N=${aluOutput.flags.negative ? 1 : 0}, Z=${aluOutput.flags.zero ? 1 : 0}, P=${aluOutput.flags.positive ? 1 : 0})`
-      );
-    } else if (decoded.opcode === OPCODE.LD) {
-      aluInputA = nextPc;
-      aluInputB = decoded.pcOffset9;
-      aluOutput = ALU.compute(aluInputA, aluInputB, control.ALUOp);
-      effectiveAddress = aluOutput.result;
-
-      const offsetStr = decoded.pcOffset9 >= 0 ? `+${decoded.pcOffset9}` : `${decoded.pcOffset9}`;
-      hardwareEvents.push(
-        `[EX Stage]  Address Adder: PC (${nextPc}) + Offset (${offsetStr}) -> Effective Address: ${effectiveAddress}`
-      );
-    }
-
-    const exPacket = {
-      ...idStage,
-      stage: 'EX',
-      aluInputA,
-      aluInputB,
-      aluOutput,
-      effectiveAddress,
-      hardwareEvents,
-    };
-    this.stageRegisters.EX = exPacket;
-    return exPacket;
-  }
-
-  phaseMemory(exStage = this.stageRegisters.EX) {
-    const { control, effectiveAddress } = exStage;
-    const hardwareEvents = [];
-    let loadedValue = null;
-
-    if (control.MemRead) {
-      this.internalBus.drive('MARMUX', effectiveAddress);
-      this.latches.latchMAR(this.internalBus.read());
-      hardwareEvents.push(
-        `[MEM Stage] Central Internal Bus: GateMARMUX=1 -> BUS <= ${effectiveAddress} -> LD_MAR=1 -> MAR <= BUS (${effectiveAddress})`
-      );
-
-      loadedValue = this.bus.readCycle(this.latches, true);
-      hardwareEvents.push(
-        `[MEM Stage] Memory Bus Interface: Read Cycle active (MemRead: ENABLED) -> Data Bus <= ${loadedValue} -> MDR <= ${loadedValue}`
-      );
-    } else if (control.MemWrite) {
-      this.internalBus.drive('MARMUX', effectiveAddress);
-      this.latches.latchMAR(this.internalBus.read());
-      hardwareEvents.push(
-        `[MEM Stage] Central Internal Bus: GateMARMUX=1 -> BUS <= ${effectiveAddress} -> LD_MAR=1 -> MAR <= BUS (${effectiveAddress})`
-      );
-      this.bus.writeCycle(this.latches, true);
-      hardwareEvents.push(
-        `[MEM Stage] Memory Bus Interface: Write Cycle active (MemWrite: ENABLED) -> MDR <= ${this.latches.MDR} -> RAM[${effectiveAddress}]`
-      );
-    } else {
-      this.bus.readCycle(this.latches, false);
-      hardwareEvents.push(
-        `[MEM Stage] Memory Bus Interface: IDLE (MemRead=0, MemWrite=0; Address and Data buses inactive)`
-      );
-    }
-
-    const memPacket = {
-      ...exStage,
-      stage: 'MEM',
-      loadedValue,
-      hardwareEvents,
-    };
-    this.stageRegisters.MEM = memPacket;
-    return memPacket;
-  }
-
-  phaseWriteBack(memStage = this.stageRegisters.MEM) {
-    const { control, decoded, aluOutput } = memStage;
-    const hardwareEvents = [];
-
-    let writeData = 0;
-    if (control.GateMDR) {
-      writeData = this.internalBus.drive('MDR', this.latches.MDR);
-      hardwareEvents.push(
-        `[WB Stage]  Central Internal Bus: GateMDR=1 -> BUS <= MDR (${writeData})`
-      );
-    } else if (control.GateALU) {
-      writeData = this.internalBus.drive('ALU', aluOutput.result);
-      hardwareEvents.push(
-        `[WB Stage]  Central Internal Bus: GateALU=1 -> BUS <= ALU_Out (${writeData})`
-      );
-    } else {
-      writeData = control.MemToReg ? this.latches.MDR : (aluOutput ? aluOutput.result : 0);
-      this.internalBus.drive('ALU', writeData);
-    }
-
-    const writeRecord = this.regFile.write(decoded.dr, writeData, control.LD_REG || control.RegWrite);
-    hardwareEvents.push(
-      `[WB Stage]  Register File (GPR): Write Port R${decoded.dr} <= BUS (${writeData}) (LD_REG: ENABLED)`
-    );
-
-    if (control.LD_CC || control.SetCC) {
-      const flags = control.GateMDR ? ALU.evaluateFlags(writeData) : aluOutput.flags;
-      this.latches.latchPSR(flags.psrFlag);
-      hardwareEvents.push(
-        `[WB Stage]  PSR Latch <= 0b${this.latches.PSR.toString(2).padStart(3, '0')} (LD_CC: ENABLED, updated from BUS value ${writeData})`
-      );
-    }
-
-    const wbPacket = {
-      ...memStage,
-      stage: 'WB',
-      writeData,
-      writeRecord,
-      hardwareEvents,
-    };
-    this.stageRegisters.WB = wbPacket;
-    return wbPacket;
-  }
 }

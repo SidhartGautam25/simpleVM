@@ -3,8 +3,6 @@ import {
   FLAG_ZERO,
 } from './constants.js';
 import { calculateConditionFlag } from './utils/condition-codes.js';
-import { InstructionDecoder } from './cpu/instruction-decoder.js';
-import { INSTRUCTION_DISPATCH_TABLE } from './cpu/instruction-handlers.js';
 import { InstructionDescriber } from './cpu/instruction-describer.js';
 import { Assembler } from './assembler/assembler.js';
 import { RegisterFile } from './storage/register-file.js';
@@ -134,8 +132,6 @@ export default class VM {
       instruction: pipelineResult.instruction,
       decoded: pipelineResult.decoded,
       execution: pipelineResult.execution,
-      stages: pipelineResult.stages,
-      pipeline: pipelineResult.stages,
       cyclesTaken: pipelineResult.cyclesTaken,
       microCycles: pipelineResult.microCycles,
       description,
@@ -150,25 +146,6 @@ export default class VM {
   setCC(registerIndex) {
     const val = this.regFile.readPortA(registerIndex);
     this.latches.latchPSR(calculateConditionFlag(val));
-  }
-
-  /**
-   * Decodes and executes an instruction word using the dispatch table.
-   *
-   * @param {number} instruction - 16-bit instruction word
-   * @returns {{ decoded: object, execution: object|null }}
-   */
-  perform(instruction) {
-    const decoded = InstructionDecoder.decode(instruction);
-    const handler = INSTRUCTION_DISPATCH_TABLE[decoded.opcode];
-
-    if (!handler) {
-      console.warn(`Unhandled or invalid opcode: 0b${decoded.opcode.toString(2).padStart(4, '0')}`);
-      return { decoded, execution: null };
-    }
-
-    const execution = handler(this, decoded);
-    return { decoded, execution };
   }
 
   /**

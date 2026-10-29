@@ -17,8 +17,4 @@ export function calculateConditionFlag(value) {
   return FLAG_POSITIVE;
 }
 
-/**
- * Backward compatibility alias for calculateConditionFlag.
- */
-export const signFlag = calculateConditionFlag;
 

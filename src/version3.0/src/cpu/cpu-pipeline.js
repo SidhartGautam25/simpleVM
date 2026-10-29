@@ -450,11 +450,4 @@ export class CpuPipeline {
       internalBus: this.internalBus.lastTransaction,
     };
   }
-
-  /**
-   * Alias for step() - executes one instruction across all 5 phases.
-   */
-  executeInstruction() {
-    return this.step();
-  }
 }

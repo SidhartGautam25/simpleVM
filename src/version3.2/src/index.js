@@ -13,7 +13,6 @@
  *   - cpu/alu.js: 16-bit Arithmetic Logic Unit with condition code evaluation
  *   - cpu/instruction-decoder.js: Instruction field unpacking
  *   - cpu/instruction-describer.js: Microcode state trace & snapshot output
- *   - cpu/instruction-handlers.js: Datapath execution orchestration
  *   - assembler/assembler.js: Two-pass assembly parser with literal pool management
  *   - vm.js: Virtual Machine state, vm.tick() micro-stepping, and vm.step() macro-stepping
  */
@@ -60,20 +59,15 @@ export { ALU } from './cpu/alu.js';
 
 // Re-export utility functions
 export { signExtend, toUint16, extractBits } from './utils/bit-utils.js';
-export { calculateConditionFlag, signFlag } from './utils/condition-codes.js';
+export { calculateConditionFlag } from './utils/condition-codes.js';
 
-// Re-export CPU decoder, describer, and handlers
+// Re-export CPU decoder and describer
 export { InstructionDecoder } from './cpu/instruction-decoder.js';
 export {
   InstructionDescriber,
   formatBinaryWithGroups,
   formatConditionCode,
 } from './cpu/instruction-describer.js';
-export {
-  handleAdd,
-  handleLd,
-  INSTRUCTION_DISPATCH_TABLE,
-} from './cpu/instruction-handlers.js';
 
 // Re-export Assembler
 export { Assembler } from './assembler/assembler.js';

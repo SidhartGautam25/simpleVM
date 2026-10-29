@@ -92,22 +92,6 @@ export class InternalBus {
     return this.value;
   }
 
-  /**
-   * Drives the bus by source name (maps to 3-bit gate code for backwards compatibility).
-   *
-   * @param {string} sourceName - 'PC', 'MDR', 'ALU', 'MARMUX'
-   * @param {number} val - 16-bit word
-   * @returns {number}
-   */
-  drive(sourceName, val) {
-    let gateCode = BUS_GATE.NONE;
-    if (sourceName === 'PC') gateCode = BUS_GATE.PC;
-    else if (sourceName === 'MDR') gateCode = BUS_GATE.MDR;
-    else if (sourceName === 'ALU') gateCode = BUS_GATE.ALU;
-    else if (sourceName === 'MARMUX') gateCode = BUS_GATE.MARMUX;
-
-    return this.driveWithGate(gateCode, val);
-  }
 
   /**
    * Reads the current 16-bit value on the central bus.
