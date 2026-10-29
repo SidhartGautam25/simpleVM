@@ -1,0 +1,443 @@
+================================================================================
+          COMPUTER ARCHITECTURE THEORY & CONCEPTS: VERSION 3.5
+   TRUE IN-FLIGHT PIPELINED OVERLAP, PIPELINE REGISTERS, DATA HAZARDS,
+         FORWARDING / BYPASSING UNITS, AND PIPELINE INTERLOCKS
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Introduction & Overview: What Are These Topics?
+2. Why Do These Concepts Exist? (The Throughput Bottleneck of Non-Pipelined CPUs)
+   A. Single-Cycle Datapaths: Bound by the Slowest Path
+   B. Multi-Cycle Datapaths: High Clock Rate, Low Instruction Throughput (IPC = 0.2)
+   C. The Assembly-Line Revolution: Pipelining Towards IPC ≈ 1.0
+3. In-Depth Physical & Micro-Architectural Theory
+   A. The Classic 5-Stage RISC / LC-3 Pipeline
+      • IF  (Instruction Fetch)
+      • ID  (Instruction Decode & Register Read)
+      • EX  (Execute / Address Calculation)
+      • MEM (Memory Access)
+      • WB  (Write-Back / Commit)
+   B. Physical Pipeline Registers (IF/ID, ID/EX, EX/MEM, MEM/WB)
+   C. The Three Classic Pipeline Hazards:
+      • Structural Hazards (Resource contention)
+      • Data Hazards (RAW, WAR, WAW)
+      • Control Hazards (Branches & jumps)
+   D. Deep Dive: Read-After-Write (RAW) Data Hazards
+   E. The Forwarding / Bypassing Unit
+      • EX->EX Forwarding (ALU to ALU bypass)
+      • MEM->EX Forwarding (Memory/ALU commit to ALU bypass)
+      • Forwarding Multiplexer Selection Logic
+   F. Load-Use RAW Hazards & Pipeline Interlocks
+      • The Time-Travel Paradox: Why Forwarding Alone Cannot Resolve Load-Use
+      • Hardware Interlock Logic: PC Freeze, IF/ID Freeze, NOP Bubble Injection
+4. Structural Schematics & Hardware Datapath Diagrams
+   A. 5-Stage Pipelined Datapath with Forwarding MUXes & Hazard Unit (ASCII Circuit Diagram)
+   B. Timeline Reservation Table Comparison (Serial vs. Pipelined Overlap)
+   C. Load-Use Hazard Bubble Insertion Sequence Diagram
+5. How These Concepts Assist Program Execution & System Performance
+   A. Pipelined Throughput: Understanding IPC vs. CPI
+   B. Latency vs. Throughput Distinction
+   C. The Role of Compilers & Instruction Scheduling
+6. Implementation in Version 3.5 Codebase
+   A. `cpu/hazard-unit.js` (`ForwardingUnit`, `HazardDetectionUnit`, `HazardUnit`)
+   B. `cpu/cpu-pipeline.js` (Concurrent 5-Stage Tick & Pipeline Registers)
+   C. `cpu/instruction-describer.js` (Reservation Table Visualizer & Graduation Reports)
+   D. `vm.js` (Micro-stepping `vm.tick()`, Macro-stepping `vm.step()`, and Run Metrics)
+
+
+================================================================================
+1. INTRODUCTION & OVERVIEW: WHAT ARE THESE TOPICS?
+================================================================================
+
+In earlier versions of our virtual computer, instructions were executed one after
+another in strict isolation:
+  - In Version 2, an instruction took a single monolithic software step.
+  - In Versions 3.1 through 3.4, an instruction took multiple clock cycles
+    (Fetch-1 -> Fetch-2 -> Fetch-3 -> Decode -> Execute -> Write-Back), taking
+    5 to 6 physical clock cycles per instruction.
+However, during every clock cycle, only ONE subcomponent of the CPU was actively
+doing useful work: while the ALU was executing in cycle 5, the memory unit,
+instruction fetch unit, and decoder sat completely idle!
+
+A **Pipelined Datapath** reorganizes the processor like a modern industrial
+manufacturing assembly line. Instead of waiting for a single instruction to
+complete all 5 stages before fetching the next one, the CPU overlaps execution:
+at every single clock pulse, all 5 stages (IF, ID, EX, MEM, WB) operate
+simultaneously on 5 different in-flight instructions!
+
+This micro-architectural breakthrough introduces critical hardware requirements:
+  1. **Pipeline Registers**: Edge-triggered register banks placed between
+     stages (`IF_ID`, `ID_EX`, `EX_MEM`, `MEM_WB`) to hold in-flight instruction
+     operands, control words, and results across clock edges.
+  2. **Data Hazards (Read-After-Write - RAW)**: Situations where instruction $i+1$
+     needs to read a register that instruction $i$ hasn't written back yet.
+  3. **Forwarding / Bypassing Unit**: Hardware routing wires and multiplexers
+     that capture newly computed results from `EX/MEM` or `MEM/WB` and feed them
+     directly back into the ALU inputs in the EX stage with **0 stall cycles**.
+  4. **Hazard Detection Unit & Pipeline Interlocks**: Hardware monitoring logic
+     that detects when an instruction immediately depends on a `LD` (Load)
+     instruction whose data has not yet arrived from memory, freezing the
+     pipeline and inserting a **1-cycle NOP bubble**.
+
+
+================================================================================
+2. WHY DO THESE CONCEPTS EXIST? (THE THROUGHPUT BOTTLENECK)
+================================================================================
+
+To understand why pipelining revolutionized computing, consider the three
+fundamental execution models in computer architecture history:
+
+A. Single-Cycle Datapaths: Bound by the Slowest Path
+----------------------------------------------------
+In a single-cycle CPU, every instruction must complete all operations (Fetch,
+Decode, ALU, Memory Access, Register Write) in one gigantic clock period:
+  Clock Period $T_{clk} = T_{fetch} + T_{decode} + T_{alu} + T_{mem} + T_{reg}$
+If memory takes 5ns, ALU takes 3ns, and decode takes 2ns, the clock cycle must be
+at least 15ns (maximum frequency 66 MHz). Even a simple `ADD` that needs no memory
+must wait the full 15ns. The clock cannot run any faster than the slowest possible
+instruction in the architecture.
+
+B. Multi-Cycle Datapaths: High Clock Rate, Low Instruction Throughput
+---------------------------------------------------------------------
+In a multi-cycle CPU (like our Version 3.1 - 3.4), each stage takes 1 clock cycle:
+  - Cycle 1: Fetch
+  - Cycle 2: Decode
+  - Cycle 3: Execute
+  - Cycle 4: Memory Access
+  - Cycle 5: Write-Back
+The clock period is short ($T_{clk} = \max(T_{stage}) \approx 3\text{ns}$), allowing
+a 333 MHz clock. However, because each instruction takes 5 cycles to complete
+serially, the **Cycles Per Instruction (CPI)** is 5.0, and the
+**Instructions Per Cycle (IPC)** is only $1 / 5 = 0.20$.
+To execute 1,000 instructions takes 5,000 clock cycles!
+
+C. The Assembly-Line Revolution: Pipelining Towards IPC ≈ 1.0
+------------------------------------------------------------
+Pipelining combines the fast clock period of multi-cycle designs with the
+one-instruction-per-cycle throughput of single-cycle designs:
+  - At Cycle 1: Fetch Instruction 1.
+  - At Cycle 2: Fetch Instruction 2, while Decoding Instruction 1.
+  - At Cycle 3: Fetch Instruction 3, while Decoding Instruction 2, while Executing Instruction 1.
+  - At Cycle 4: Fetch Instruction 4, while Decoding 3, Executing 2, Memory Access for 1.
+  - At Cycle 5: Fetch Instruction 5, while Decoding 4, Executing 3, Memory Access 2, Write-Back 1.
+Starting at Cycle 5, **one instruction completes every single clock cycle**!
+To execute 1,000 instructions takes only 1,004 clock cycles:
+  $$\text{Throughput Speedup} = \frac{5,000 \text{ cycles}}{1,004 \text{ cycles}} \approx 4.98\times \text{ faster!}$$
+
+
+================================================================================
+3. IN-DEPTH PHYSICAL & MICRO-ARCHITECTURAL THEORY
+================================================================================
+
+A. The Classic 5-Stage RISC / LC-3 Pipeline
+-------------------------------------------
+The datapath is partitioned into 5 independent balanced stages:
+
+  1. **IF (Instruction Fetch)**:
+     - Drives the Program Counter (`PC`) onto the address bus.
+     - Reads the 16-bit instruction word from memory / instruction cache.
+     - Computes the default next sequential PC: $\text{NextPC} = (\text{PC} + 1) \ \& \ \text{0xFFFF}$.
+     - Captures output into the `IF/ID` pipeline register.
+
+  2. **ID (Instruction Decode & Register Read)**:
+     - Unpacks 16-bit opcode, destination register `DR`, source registers `SR1`, `SR2`,
+       and sign-extended immediate fields (`imm5`, `pcOffset9`).
+     - Reads dual read ports of the General Purpose Register File (`R0` - `R7`).
+     - The Control Unit combinatorially generates all control wire signals.
+     - The Hazard Detection Unit evaluates potential Load-Use hazards.
+     - Captures output into the `ID/EX` pipeline register.
+
+  3. **EX (Execute / Address Calculation)**:
+     - The Forwarding Unit evaluates whether `SR1` or `SR2` operands should be
+       bypassed from `EX/MEM` or `MEM/WB`.
+     - The ALU performs arithmetic or logical operations (`ADD`, `AND`, `NOT`).
+     - For memory instructions (`LD`, `ST`), the address adder computes the
+       effective memory address: $\text{EffectiveAddress} = \text{NextPC} + \text{SEXT}(\text{offset9})$.
+     - Captures output into the `EX/MEM` pipeline register.
+
+  4. **MEM (Memory Access)**:
+     - For instructions with `MemRead = 1` (`LD`), drives `EffectiveAddress` to MAR
+       and reads memory word through the Address Decoder into MDR.
+     - For instructions with `MemWrite = 1` (`ST`), drives write data from MDR to RAM.
+     - For ALU instructions, passes `aluResult` straight through to `finalValue`.
+     - Captures output into the `MEM/WB` pipeline register.
+
+  5. **WB (Write-Back / Architectural Commit)**:
+     - If `RegWrite = 1`, writes `finalValue` into Register File at address `DR`.
+     - If `SetCC = 1`, evaluates sign and zero bits to update Processor Status Register (`PSR`).
+     - Instruction graduates and commits to architectural state!
+
+B. Physical Pipeline Registers (IF/ID, ID/EX, EX/MEM, MEM/WB)
+-------------------------------------------------------------
+In physical silicon, combinational logic (such as adders and decoders) cannot hold
+data; their outputs fluctuate as inputs change. Therefore, clocked D flip-flops
+must form **Pipeline Registers** at the physical boundaries between stages.
+On every rising edge of the quartz clock oscillator, all pipeline registers
+latch their inputs simultaneously:
+
+  [IF] ---> | IF/ID | ---> [ID] ---> | ID/EX | ---> [EX] ---> | EX/MEM | ---> [MEM] ---> | MEM/WB | ---> [WB]
+
+Each pipeline register carries both datapath operands AND the micro-architectural
+control signals required by downstream stages.
+
+C. The Three Classic Pipeline Hazards
+-------------------------------------
+Pipelining is not free; overlapping instructions creates hazards:
+  1. **Structural Hazards**: Two stages competing for the same physical hardware
+     (e.g., IF and MEM trying to access a single-ported RAM at the same time).
+     Resolved in hardware by separate Instruction and Data caches (Harvard architecture).
+  2. **Data Hazards**: An instruction depends on the result of an earlier instruction
+     that is still in the pipeline.
+  3. **Control Hazards**: Pipelining fetches the next instruction before a branch
+     condition (`BRp`, `BRz`, `JMP`) has been evaluated in EX/MEM.
+
+D. Deep Dive: Read-After-Write (RAW) Data Hazards
+-------------------------------------------------
+Consider this assembly sequence:
+  `I1: ADD R1, R2, R3   ; Writes to R1`
+  `I2: ADD R4, R1, #5   ; Reads R1 in the very next instruction!`
+
+Without hazard handling, examine what happens across clock cycles:
+  Cycle 1: I1 is in IF.
+  Cycle 2: I1 is in ID, I2 is in IF.
+  Cycle 3: I1 is in EX (computing R1 = R2 + R3), I2 is in ID (reading R1 from RegFile).
+  *** DISASTER! *** In Cycle 3, I1 has only computed R1 inside the ALU. R1 has NOT been
+  written back to the Register File! I2 reads stale, outdated data from R1!
+  I1 will not write to R1 until Cycle 5 (WB stage)!
+  Without hardware support, the CPU would need to stall for 2 full clock cycles.
+
+E. The Forwarding / Bypassing Unit
+----------------------------------
+Notice where the desired data actually resides:
+  - At the end of Cycle 3, the new value of R1 is sitting in the `EX/MEM` register!
+  - In Cycle 4, I2 enters the EX stage.
+The **Forwarding Unit** adds direct multiplexer feedback wires from `EX/MEM` and `MEM/WB`
+back into the inputs of the ALU:
+
+  1. **EX->EX Forwarding (Hazard Condition 1a / 1b)**:
+     `if (EX_MEM.RegWrite && !EX_MEM.MemRead && EX_MEM.dr == ID_EX.sr1)`
+     Multiplexer selects `FORWARD_MUX.EX_MEM` (`0b01`).
+     ALU Input A receives `EX_MEM.aluResult` directly with **0 stall cycles**!
+
+  2. **MEM->EX Forwarding (Hazard Condition 2a / 2b)**:
+     `if (MEM_WB.RegWrite && MEM_WB.dr == ID_EX.sr1 && !EX_Hazard)`
+     Multiplexer selects `FORWARD_MUX.MEM_WB` (`0b10`).
+     ALU Input A receives `MEM_WB.finalValue` directly with **0 stall cycles**!
+
+F. Load-Use RAW Hazards & Pipeline Interlocks
+---------------------------------------------
+Can forwarding eliminate ALL stalls? No!
+Consider a `LD` (Load) followed immediately by a dependent instruction:
+  `I1: LD  R1, #100    ; Loads data from memory into R1`
+  `I2: ADD R2, R1, #5   ; Needs R1 immediately`
+
+Let's check the pipeline timeline:
+  Cycle 3: I1 is in EX (calculating address). The data is still inside physical RAM!
+           I2 is in ID (trying to decode and fetch R1).
+  Cycle 4: I1 is in MEM (reading RAM). The data only emerges at the END of Cycle 4.
+           I2 is in EX (needing R1 at the START of Cycle 4).
+Even with forwarding wires, data cannot travel backward in time!
+
+**The Solution: Hardware Interlocks and Bubble Injection**:
+The `HazardDetectionUnit` detects:
+  `if (ID_EX.MemRead && (ID_EX.dr == IF_ID.sr1 || ID_EX.dr == IF_ID.sr2))`
+When this condition is true:
+  1. **Freeze PC**: Prevent `latches.PC` from incrementing.
+  2. **Freeze IF/ID Register**: Preserve `IF_ID` so instruction I2 is decoded again next cycle.
+  3. **Inject NOP Bubble**: Insert a NOP bubble into `next_ID_EX` (`valid = false`, control wires cleared).
+Result:
+  In Cycle 4:
+    - I1 advances to MEM stage.
+    - The NOP bubble enters EX stage.
+    - I2 remains in ID stage.
+  In Cycle 5:
+    - I1 reaches MEM/WB stage with data ready in `finalValue`.
+    - I2 enters EX stage.
+    - Forwarding Unit forwards data from `MEM/WB` directly into ALU Input A!
+**The hazard is resolved with exactly 1 stall cycle penalty!**
+
+
+================================================================================
+4. STRUCTURAL SCHEMATICS & HARDWARE DATAPATH DIAGRAMS
+================================================================================
+
+A. 5-Stage Pipelined Datapath with Forwarding MUXes & Hazard Unit
+-----------------------------------------------------------------
+
+  +-------------------------------------------------------------------------------------------------------------------+
+  |                                                  PIPELINED CPU DATAPATH                                           |
+  +-------------------------------------------------------------------------------------------------------------------+
+
+     [PC] --------> (AddressBus)
+       |                 |
+       v                 v
+   +-------+        +----------+
+   | IF/ID | <====  | RAM/MMIO | (Instruction Fetch via Address Decoder)
+   +-------+        +----------+
+       |
+       |------------------------+
+       v                        v
+  +----------+           +--------------+
+  |  DECODE  |           | HAZARD UNIT  | ===== [Freeze PC & Freeze IF/ID]
+  |    &     |           | (Detection)  | ===== [Inject NOP Bubble into ID/EX]
+  | REG FILE |           +--------------+
+  +----------+                  ^
+       |                        | (Monitors ID_EX.MemRead & Reg Dependencies)
+       v                        |
+   +-------+                    |
+   | ID/EX | -------------------+
+   +-------+
+       |
+       |----+---------------------------------------------------+
+       |    |                                                   |
+       |    v                                                   v
+       |  +--------------------+                             +--------------------+
+       |  |  Forwarding MUX A  | <== [EX/MEM Bypass Wire] == |  Forwarding MUX B  |
+       |  |  (2-bit Selector)  | <== [MEM/WB Bypass Wire] == |  (2-bit Selector)  |
+       |  +--------------------+                             +--------------------+
+       |            |                                                   |
+       |            v                                                   v
+       |      +---------------------------------------------------------------+
+       |      |                              ALU                              |
+       |      +---------------------------------------------------------------+
+       |                                      |
+       v                                      v
+   +--------+                             +--------+
+   | EX/MEM | <========================== | Result |
+   +--------+
+       |
+       |------------------------+ [EX->EX Bypass Path to MUX A & B]
+       v
+  +----------+
+  |   MEM    | <=======> (Unified 3-Part System Bus: AddressBus, DataBus, ControlBus)
+  |  ACCESS  |
+  +----------+
+       |
+       v
+   +--------+
+   | MEM/WB | <-----------------+ [MEM->EX Bypass Path to MUX A & B]
+   +--------+
+       |
+       v
+  +----------+
+  |  WRITE   | ========> Writes to Register File (R0-R7) & Updates PSR Condition Codes
+  |   BACK   |
+  +----------+
+
+
+B. Timeline Reservation Table Comparison (Serial vs. Pipelined Overlap)
+-----------------------------------------------------------------------
+
+1. Multi-Cycle Serial Datapath (Version 3.4):
+   Cycle :  1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+   Inst 1: [F1][F2][F3][ID][EX][WB]
+   Inst 2:                         [F1][F2][F3][ID][EX][WB]
+   Inst 3:                                                 [F1][F2][F3][ID][EX][WB]
+   -> 3 instructions take 18 clock cycles! (CPI = 6.0, IPC = 0.167)
+
+2. True 5-Stage In-Flight Pipelined Datapath (Version 3.5):
+   Cycle :  1   2   3   4   5   6   7
+   Inst 1: [IF][ID][EX][MEM][WB]
+   Inst 2:     [IF][ID][EX ][MEM][WB]      (EX->EX Forwarded, 0 stalls!)
+   Inst 3:         [IF][ID ][EX ][MEM][WB] (EX->EX Forwarded, 0 stalls!)
+   -> 3 instructions take 7 clock cycles! (Graduation rate: 1 inst/cycle after fill)
+
+
+C. Load-Use Hazard Bubble Insertion Sequence Diagram
+-----------------------------------------------------
+
+  Clock Cycle:      1       2       3           4          5       6       7
+  ----------------------------------------------------------------------------
+  I1: LD  R1, #10  [IF] -> [ID] -> [EX]    -> [MEM]   -> [WB]
+  I2: ADD R2, R1, #5       [IF] -> [ID]    -> [STALL] -> [EX] -> [MEM] -> [WB]
+                                 (Hazard!)     (Bubble)   (FWD from MEM/WB)
+  I3: ADD R3, R2, #1               (Frozen)->   [IF]  -> [ID] -> [EX]  -> [MEM]
+  ----------------------------------------------------------------------------
+  Interlock Event: At Cycle 3, HazardDetectionUnit halts I2 in ID, inserts a
+  NOP bubble into EX in Cycle 4, and MEM->EX forwarding supplies R1 at Cycle 5!
+
+
+================================================================================
+5. HOW THESE CONCEPTS ASSIST PROGRAM EXECUTION & SYSTEM PERFORMANCE
+================================================================================
+
+A. Pipelined Throughput: Understanding IPC vs. CPI
+--------------------------------------------------
+In processor performance analysis, execution time is defined by the Iron Law:
+  $$\text{Execution Time} = \text{Instruction Count} \times \text{CPI} \times \text{Clock Cycle Time}$$
+While pipelining does not decrease the latency of an individual instruction (an
+instruction still takes 5 clock cycles from fetch to graduation), it dramatically
+increases the **THROUGHPUT** of the entire instruction stream.
+Once the 5-stage pipeline is full, each clock tick produces one retired instruction:
+  $$\lim_{N \to \infty} \text{IPC} = 1.0, \quad \lim_{N \to \infty} \text{CPI} = 1.0$$
+
+B. Latency vs. Throughput Distinction
+-------------------------------------
+  - **Latency**: The time required for one individual instruction to traverse
+    from IF to WB (5 clock cycles).
+  - **Throughput**: The rate at which the CPU graduates instructions per unit of
+    time (1 instruction per cycle).
+An automobile assembly line may take 20 hours to assemble a car from start to finish
+(latency = 20 hours), but if a new car rolls off the line every 2 minutes, the
+throughput is 30 cars per hour. Pipelining applies this exact manufacturing principle
+to binary instructions.
+
+C. The Role of Compilers & Instruction Scheduling
+-------------------------------------------------
+Understanding pipeline hazards allows optimizing compilers to reorder instructions:
+  // Poor ordering (causes 1-cycle stall bubble):
+  LD  R1, #100
+  ADD R2, R1, #5      // Stall!
+
+  // Optimized compiler schedule (zero stall cycles):
+  LD  R1, #100
+  ADD R4, R4, #1      // Independent instruction fills delay slot!
+  ADD R2, R1, #5      // Data already in MEM/WB -> forwarded with 0 stalls!
+
+
+================================================================================
+6. IMPLEMENTATION IN VERSION 3.5 CODEBASE
+================================================================================
+
+The Version 3.5 implementation strictly isolates each pipeline stage and hazard unit:
+
+A. `cpu/hazard-unit.js`
+-----------------------
+  - `ForwardingUnit.resolve(id_ex, ex_mem, mem_wb)`:
+    Evaluates RAW dependencies on SR1 and SR2. Determines whether to select
+    `FORWARD_MUX.ORIGINAL` (`0b00`), `FORWARD_MUX.EX_MEM` (`0b01`), or
+    `FORWARD_MUX.MEM_WB` (`0b10`), ensuring `EX/MEM` overrides `MEM/WB` when
+    both instructions write to the same register.
+  - `HazardDetectionUnit.check(if_id, id_ex)`:
+    Monitors `id_ex.control.MemRead`. If destination register matches `if_id.sr1`
+    or `if_id.sr2`, returns `{ stall: true, bubbleInserted: true }`.
+  - `HazardUnit`:
+    Aggregates metrics (`totalStalls`, `totalBubbles`, `totalForwardings`).
+
+B. `cpu/cpu-pipeline.js`
+------------------------
+  - Replaces the multi-cycle MicroSequencer FSM with 4 edge-triggered pipeline
+    registers: `this.IF_ID`, `this.ID_EX`, `this.EX_MEM`, `this.MEM_WB`.
+  - `tick()` executes all 5 stages in parallel on every quartz clock transition:
+      • WB writes to RegisterFile and PSR.
+      • MEM executes memory bus cycles.
+      • EX executes ALU operations using forwarded operands.
+      • ID reads registers and checks hazards.
+      • IF fetches instruction words via AddressDecoder.
+  - `step()` macro-steps the CPU until the next instruction graduates from WB.
+
+C. `cpu/instruction-describer.js`
+---------------------------------
+  - `describePipelineReservationTable(cycleRecords)`: Renders ASCII reservation
+    table showing in-flight instructions across all 5 stages.
+  - `describeGraduation(graduated)`: Formats commit report on retirement.
+  - `describeHazardSummary(vm)`: Telemetry summary of stalls, bubbles, and bypasses.
+
+D. `vm.js`
+----------
+  - Integrates the 5-stage pipeline with the Unified 3-Part System Bus and MMIO
+    Address Decoder.
+  - Exposes real-time throughput metrics: `vm.ipc`, `vm.cpi`, `vm.tick()`, `vm.step()`,
+    and `vm.describePipeline()`.
+================================================================================

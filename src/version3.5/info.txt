@@ -1,0 +1,145 @@
+================================================================================
+   VERSION 3.5: TRUE IN-FLIGHT PIPELINED OVERLAP & HAZARD UNIT ARCHITECTURE
+================================================================================
+
+1. OVERVIEW & PURPOSE
+---------------------
+Version 3.5 upgrades our LC-3 virtual computer from a multi-cycle sequential CPU
+to a **True 5-Stage In-Flight Pipelined Processor** featuring:
+  1. **Concurrent 5-Stage Pipeline (`cpu/cpu-pipeline.js`)**:
+     - At every single clock cycle, up to 5 instructions operate simultaneously across:
+         • **IF**  (Instruction Fetch): Fetches next machine word from RAM/MMIO via Address Decoder.
+         • **ID**  (Instruction Decode): Unpacks opcode, reads dual Register File ports, checks hazards.
+         • **EX**  (Execute / Address Calc): Evaluates ALU ops, resolves forwarding multiplexers.
+         • **MEM** (Memory Access): Performs RAM / MMIO read/write bus cycles via Unified System Bus.
+         • **WB**  (Write-Back / Commit): Commits final results into Register File & updates PSR flags.
+  2. **Forwarding / Bypassing Unit (`cpu/hazard-unit.js`)**:
+     - Resolves Read-After-Write (RAW) data hazards for ALU-to-ALU dependencies with **ZERO STALLS**.
+     - Bypasses results directly from `EX/MEM` or `MEM/WB` to the ALU input multiplexers (`ForwardA`, `ForwardB`).
+  3. **Hazard Detection Unit & Pipeline Interlocks (`cpu/hazard-unit.js`)**:
+     - Detects **Load-Use RAW Hazards** where an instruction in ID requires data currently being fetched
+       by an in-flight `LD` instruction in EX.
+     - Automatically asserts pipeline interlocks:
+         • Freezes Program Counter (`PC` write disable).
+         • Freezes `IF/ID` pipeline register (re-decodes same instruction).
+         • Injects a **1-cycle NOP bubble** into `ID/EX` to stall dependent execution by exactly 1 clock.
+  4. **High Throughput Approaching 1 Instruction Per Cycle ($IPC \approx 1.0$)**:
+     - Under full pipeline flow, 1 instruction commits/graduates every physical clock cycle.
+     - Delivers up to **5x performance speedup** compared to Version 3.4 multi-cycle sequential execution.
+  5. **Pipeline Reservation Table & Performance Telemetry (`cpu/instruction-describer.js`)**:
+     - Provides an authentic ASCII reservation table and cycle-by-cycle stage occupancy timeline.
+     - Reports real-time $IPC$, $CPI$, total forwardings, and stall bubble counts.
+
+
+================================================================================
+2. HOW VERSION 3.5 DIFFERS FROM VERSION 3.4
+================================================================================
+
+Feature                    Version 3.4 (Multi-Cycle FSM)    Version 3.5 (True 5-Stage Pipelined)
+-------------------------  -------------------------------  ---------------------------------------------
+Execution Concurrency      Sequential (1 instruction active)**Concurrent (Up to 5 instructions in-flight)**
+Pipeline Stages            Time-multiplexed cycles          **IF, ID, EX, MEM, WB operating in parallel**
+Pipeline Registers         None (Shared architectural latches)**4 Hardware Registers (IF_ID, ID_EX, EX_MEM, MEM_WB)**
+Cycles Per Instruction     CPI = 5 to 6 cycles              **CPI ≈ 1.0 (Approaching 1 cycle per instruction)**
+Instructions Per Cycle     IPC = 0.16 to 0.20               **IPC ≈ 1.0 under sustained pipeline overlap**
+RAW Data Dependencies      Waits full instruction finish    **Forwarding Unit (EX->EX and MEM->EX bypasses)**
+Forwarding Stall Penalty   N/A (Executes serially)          **0 Stall Cycles (ALU-to-ALU dependencies)**
+Load-Use Hazard Handling   N/A (Executes serially)          **Hazard Detection Unit injects 1 NOP bubble stall**
+Pipeline Interlocks        None                             **Hardware freeze of PC & IF/ID on Load-Use**
+Instruction Commit         Single commit per macro-step     **Graduation at WB stage while other stages run**
+Visualization              Single instruction micro-trace   **5-Stage ASCII Reservation Table & Timeline**
+
+
+================================================================================
+3. HARDWARE PIPELINE REGISTERS
+================================================================================
+
+Between each adjacent pipeline stage sits an edge-triggered hardware pipeline register
+that latches state on the rising edge of the quartz clock:
+
+  1. **IF/ID Register**:
+     - `pc`             : Address of fetched instruction (16 bits)
+     - `nextPc`         : Incremented PC ($PC + 1$)
+     - `rawInstruction` : 16-bit binary instruction word fetched from memory
+     - `decoded`        : Pre-decoded instruction fields for fast hazard checking
+     - `valid`          : 1-bit binary flag indicating valid instruction occupancy
+
+  2. **ID/EX Register**:
+     - `pc`, `nextPc`, `rawInstruction`, `decoded` : Pipelined instruction metadata
+     - `control`        : Micro-architectural control signal bundle from ControlUnit
+     - `sr1Val`         : Value read from Register File Port 1
+     - `sr2Val`         : Value read from Register File Port 2
+     - `valid`          : 1-bit binary occupancy flag (0 indicates a NOP bubble)
+
+  3. **EX/MEM Register**:
+     - `aluResult`        : 16-bit output computed by ALU
+     - `effectiveAddress`: Calculated memory address for LD / ST ($PC + 1 + SEXT(offset9)$)
+     - `writeData`       : Data word to be written to memory (for stores)
+     - `forwardDetails`  : MUX decision record from ForwardingUnit
+
+  4. **MEM/WB Register**:
+     - `aluResult`  : Computed ALU arithmetic/logic value
+     - `memData`    : 16-bit word read from RAM or MMIO device during MEM stage
+     - `finalValue` : Multiplexed final result to commit (`GateMDR` ? `memData` : `aluResult`)
+
+
+================================================================================
+4. FORWARDING / BYPASSING UNIT ARCHITECTURE
+================================================================================
+
+To resolve Read-After-Write (RAW) data hazards without stalling the CPU, the
+`ForwardingUnit` introduces 2-bit multiplexer select lines at ALU inputs A and B:
+
+  • **Select Code `0b00` (`ORIGINAL`)**:
+    Operand is taken from the Register File via the `ID/EX` register.
+  • **Select Code `0b01` (`FORWARD_EX_MEM`)**:
+    Operand is bypassed from the `EX/MEM` register (result computed 1 cycle ago).
+  • **Select Code `0b10` (`FORWARD_MEM_WB`)**:
+    Operand is bypassed from the `MEM/WB` register (result computed 2 cycles ago).
+
+Hazard Conditions Checked:
+  1. EX Hazard on Input A:
+     `if (EX_MEM.RegWrite && !EX_MEM.MemRead && EX_MEM.dr == ID_EX.sr1) -> ForwardA = 0b01`
+  2. MEM Hazard on Input A:
+     `if (MEM_WB.RegWrite && MEM_WB.dr == ID_EX.sr1 && !EX_Hazard) -> ForwardA = 0b10`
+  3. EX Hazard on Input B:
+     `if (EX_MEM.RegWrite && !EX_MEM.MemRead && EX_MEM.dr == ID_EX.sr2) -> ForwardB = 0b01`
+  4. MEM Hazard on Input B:
+     `if (MEM_WB.RegWrite && MEM_WB.dr == ID_EX.sr2 && !EX_Hazard) -> ForwardB = 0b10`
+
+
+================================================================================
+5. HAZARD DETECTION UNIT & PIPELINE INTERLOCKS
+================================================================================
+
+A **Load-Use RAW Hazard** occurs when an instruction in ID reads a register that
+is the destination of an in-flight `LD` instruction currently in the EX stage:
+  Cycle N   : LD  R1, #50    (in EX stage - calculating memory address)
+  Cycle N   : ADD R2, R1, #5 (in ID stage - trying to read R1)
+
+Because the data from memory is NOT available until the end of the MEM stage (Cycle N+1),
+hardware CANNOT forward the value into EX at Cycle N+1.
+
+**Interlock Sequence Activated by `HazardDetectionUnit`**:
+  1. **Freeze Program Counter**: `latches.PC` is not incremented.
+  2. **Freeze IF/ID Register**: `IF_ID` is preserved so the dependent instruction is re-evaluated.
+  3. **Insert NOP Bubble**: The Control Unit clears control signals for `next_ID_EX` (`valid = false`).
+  4. At Cycle N+1:
+     - `LD` advances to MEM stage and reads data from RAM into `memData`.
+     - The NOP bubble enters the EX stage (doing no work).
+     - `ADD` stays in ID stage.
+  5. At Cycle N+2:
+     - `LD` is in `MEM/WB` stage with data ready in `finalValue`.
+     - `ADD` enters `EX` stage; `ForwardingUnit` forwards the loaded data from `MEM/WB` directly into ALU Input A!
+  Total Penalty: **Exactly 1 stall cycle**, after which full pipeline speed resumes!
+
+
+================================================================================
+6. VERIFICATION & RUNNING
+================================================================================
+
+Run Version 3.5 tests:
+  $ npm run test:v3.5
+
+Run interactive demonstration showing forwarding, reservation table, and benchmarks:
+  $ npm run example:v3.5
